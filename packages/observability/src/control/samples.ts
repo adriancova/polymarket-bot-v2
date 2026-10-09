@@ -111,9 +111,6 @@ export function traderHealthSamples(
   if (transport.entriesBehindHead !== null) {
     add("trader_transport_lag_entries", transport.entriesBehindHead);
   }
-  if (transport.retentionMaxEvents !== null) {
-    add("trader_transport_retention_max_events", transport.retentionMaxEvents);
-  }
   if (transport.sampleAgeMs !== null) {
     add("trader_transport_sample_age_seconds", transport.sampleAgeMs / 1000);
   }

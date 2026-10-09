@@ -3,7 +3,7 @@
 Owner: `WP-180`
 Authority: `docs/spec/polymarket-bot-orchestrator-handoff.md` §9.8 (Risk Engine),
 §9.9 (Incident Controller — recommendations only), §6 invariants 10/12/13/18,
-§7.7 (intents and the resize rule), §14.3 (metrics are labelled by reason code)
+§7.7 (intents; a veto never mutates one), §14.3 (metrics are labelled by reason code)
 Related: [`docs/handoffs/WP-180.md`](../../docs/handoffs/WP-180.md),
 [`docs/handoffs/WP-110.md`](../../docs/handoffs/WP-110.md) (settlement payoffs),
 [ADR-016](../../docs/adr/ADR-016-ratified-inferred-domain-shapes.md) (UUID refusal),
@@ -22,14 +22,31 @@ invariant 1).
 and returns either an **approved-intent record** or the **typed refusals** that
 prevented it, plus **incident action recommendations** for the §9.9 controller.
 
-`resizeApprovedIntent(record, request)` implements §7.7's rule that "a risk veto
-never silently mutates an intent. A resize creates a new approved-intent record
-linked to the original."
+**C1-RISK (COMPLEXITY-1, 2026-10-08), the user's rulings.** Three changes to
+what this package does:
+
+- **The capital allocator is the only exposure-cap authority.** Check 15 is
+  now the per-order notional limit only. The per-market, per-instance,
+  per-series, per-underlying, per-resolution-window and global caps live in
+  the allocator's caps (`allocatorCaps` in the trader configuration). Its
+  verdict binds through check 14 (`RISK_ALLOCATION_REFUSED`), and it judges a
+  multi-leg intent on the sum of its legs. The six `*ExposureCap` policy
+  fields, their nine refusal codes and the `exposures` input are gone.
+  `limits` is strict, so a policy that still names one is refused.
+- **Check 17 values an unmarked market at `0`**: its full committed cost, the
+  floor check 16 uses. It no longer refuses a scenario for a missing mark.
+- **There is no resize path.** `resizeApprovedIntent` had no caller, and the
+  execution planner refuses rather than downsizes. It was deleted with its four
+  codes. The record keeps its stored lineage fields (§6). §7.7's "a resize
+  creates a new approved-intent record" therefore holds vacuously.
+
+The sections below that describe the hardening rounds mention the deleted
+code (`resizeApprovedIntent`, `exposure-limits.ts`) as it was then.
 
 ## 2. Three rules that shape everything here
 
 1. **Fail closed.** Unknown never permits. A missing market context, an
-   unmeasured feed, an absent exposure snapshot, an absent allocator verdict, an
+   unmeasured feed, an absent allocator verdict, an
    unbounded cost, an unsupplied scenario — each *blocks*. There is no code path
    in which absence is read as "fine".
 2. **Worst-case contractual loss is PRIMARY.** `limits.maxWorstCaseContractualLoss`
@@ -142,7 +159,7 @@ anything else the producer says about itself.
 | 14a. allocator verdict present | ✔ | — | — |
 | 14b. allocator verdict *refused* | ✔ | ✔ | — |
 | 14c. sell ≤ confirmed inventory | ✔ | ✔ | — |
-| 15. per-order / per-scope / global limits | ✔ | — | — |
+| 15. per-order notional limit (the scope caps are the allocator's: 14b) | ✔ | — | — |
 | 16. worst-case contractual loss | ✔ | reported, not enforced | reported |
 | 17. scenario loss | ✔ | reported, not enforced | reported |
 | 18. duplicate intent / self-trade | ✔ | duplicate only | — |
@@ -233,7 +250,7 @@ can carry one.
 | `context.strategyInstanceId` | **yes** | copied into every record |
 | `intent.intentId` | **yes** | copied to `sourceIntentId` and carried inside `record.intent` |
 | `guards.recentIntentIds[]` | **yes** | compared against `intentId`; a re-cased entry would silently under-match §9.8 check 18 |
-| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed by TypeScript only; everything it carries is inherited into the new record — see §4.3 and §4.4 (round 4: it is now read as data and parsed in full) |
+| `record.*` at the emission boundary | **yes** | every string of the record being emitted is checked — see §4.3 and §4.4. (Until C1-RISK, `resizeApprovedIntent` handed this boundary hand-built records; today only the engine's own drafts reach it.) |
 | any `marketId` **arriving as engine input** | n/a | `InternalMarketId` is lowercase-canonical UUIDv7 in the frozen schema, so a re-cased one is already `RISK_INPUT_INVALID` |
 | `intent.orderIds[]` | **no** | Venue-supplied **by contract**: `CancelIntentSchema.orderIds` is `z.array(VenueOrderIdSchema)`. ADR-016 §2 "does not touch any venue wire format", and its premise (every UUID here is generated in-process) is false for these: a venue string must round-trip exactly as the venue spelled it, and refusing one on a `CANCEL` would trap a position for a rule the ADR does not impose |
 | `portfolio.openOrders[].orderId` | **no** | **Corrected 2026-09-03 (review round 4).** This row used to claim the field was venue-supplied. It is **not established either way**: the schema types it only `NonEmptyString`, and the repository has both an in-process `execution.orders.order_id internal.uuid_v7` and a separate `venue_order_id` column (`db/migrations/0005_execution.up.sql`). It is out of scope on a narrower ground that does not need the answer: this door also admits a `CANCEL`, so a refusal here can trap a position, and the field never reaches an approved record. Contract-annotation follow-up R3-2 |
@@ -372,8 +389,8 @@ separately. `src/plain-data.ts` states them at length; in short:
      `recommendIncidentActions`, `settlementValueUnderOutcome` — **PROPAGATE**,
      deliberately. Containing them would mean INVENTING a measurement, and the
      only inventable number here is `"0"`: a worst-case loss of zero, or an
-     empty exposure snapshot, is precisely the fail-open
-     `RISK_EXPOSURE_ENTRY_MISSING` exists to prevent. Every in-repository call
+     empty exposure snapshot, is precisely the fail-open the (since C1-RISK
+     deleted) exposure-entry refusal existed to prevent. Every in-repository call
      site runs inside `contained`, so no public ANSWER of this package is ever
      an exception; the classification test runs each hostile call and requires
      it to throw, so the entry is a measurement rather than a hope.
@@ -402,8 +419,8 @@ Two more round-5 corrections, both narrowings rather than repairs:
   A scope key is a `CodeString`, so `"constructor"` is admissible input, and
   `table["constructor"]` answers the `Object` constructor rather than
   `undefined` — which would have read as a *measured* scope carrying no
-  numbers, bypassing `RISK_EXPOSURE_ENTRY_MISSING` (§5, "Check 15 — capacity
-  limits"; review round 1, BLOCKER 2) and feeding `undefined` to decimal
+  numbers, bypassing the exposure-entry refusal (review round 1, BLOCKER 2;
+  deleted with the scope caps by C1-RISK) and feeding `undefined` to decimal
   arithmetic.
 
 Pinned by `test/unit/risk/engine.test.ts`, describe blocks *"the data-record
@@ -542,7 +559,7 @@ live (§6 invariant 2, §12.4).
 
 ## 5. Reason codes — the PACKAGE-OWNED vocabulary
 
-**The vocabulary has exactly 62 codes**, all listed below.
+**The vocabulary has exactly 48 codes**, all listed below.
 
 Every rejection, approval, and recommendation carries a code from this list.
 Codes follow the frozen `CodeString` grammar (`^[A-Za-z][A-Za-z0-9_.:-]*$`, ≤ 64
@@ -558,14 +575,21 @@ declared set** — the three surfaces are bound together by test.
 > **Corrected 2026-09-02 (remediation round 1).** `docs/handoffs/WP-180.md`
 > claimed a 56-code vocabulary against a list that actually held 61 (adversarial
 > review round 1, MEDIUM); the count is now pinned in code and asserted, and
-> `RISK_EXPOSURE_ENTRY_MISSING` was added by the BLOCKER-2 fix in the same
+> the exposure-entry refusal was added by the BLOCKER-2 fix in the same
 > round, bringing the total to 62.
+
+> **C1-RISK (2026-10-08).** 14 codes with no remaining producer were removed,
+> bringing the total to 48: the nine check-15 exposure and scope codes (global,
+> instance, market, series, underlying and resolution-window exposure exceeded;
+> snapshot missing; entry missing; scope key missing), the check-17
+> marks-incomplete code, and the four resize codes. None was ever recorded in a
+> run.
 
 ### Input validation
 
 | Code | Meaning |
 | --- | --- |
-| `RISK_INPUT_INVALID` | The evaluation input, the policy, the resize request, or a resize's INHERITED intent failed its schema. |
+| `RISK_INPUT_INVALID` | The evaluation input or the policy failed its schema (a policy naming a retired `*ExposureCap` field included), or a record being emitted does not satisfy the record contract. |
 | `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. The door's fields and the venue exclusion are in §4.2; the record rule that covers every other position is §4.3, and the data-record boundary it rests on is §4.4. |
 | `RISK_INTENT_EXPIRED` | `validUntil` is before the caller-supplied evaluation instant, or the two are not comparable. |
 | `RISK_ZERO_DELTA` | The position intent resolves to no share delta; there is nothing to execute. |
@@ -627,25 +651,17 @@ declared set** — the three surfaces are bound together by test.
 | `RISK_SELL_EXCEEDS_INVENTORY` | A sell leg exceeds the confirmed holding (§6 invariant 10). |
 | `RISK_QUOTE_MAX_INVENTORY_EXCEEDED` | A fully-filled quote ladder would breach the intent's own `maximumInventory`. |
 
-### Check 15 — capacity limits
+### Check 15 — the per-order limit
 
 | Code | Meaning |
 | --- | --- |
 | `RISK_PER_ORDER_NOTIONAL_EXCEEDED` | The intent's bounded notional exceeds the per-order limit. |
-| `RISK_GLOBAL_EXPOSURE_EXCEEDED` | The global cap. |
-| `RISK_INSTANCE_EXPOSURE_EXCEEDED` | The per-strategy-instance cap. |
-| `RISK_MARKET_EXPOSURE_EXCEEDED` | The per-market cap. |
-| `RISK_SERIES_EXPOSURE_EXCEEDED` | The per-series cap. |
-| `RISK_UNDERLYING_EXPOSURE_EXCEEDED` | The per-underlying cap. |
-| `RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED` | The per-resolution-window cap. |
-| `RISK_EXPOSURE_SNAPSHOT_MISSING` | A cap is configured and no snapshot was supplied. An unmeasured limit is not a passed limit. |
-| `RISK_EXPOSURE_ENTRY_MISSING` | A cap is configured and the supplied snapshot carries **no entry** for the queried scope. An absent entry is *unknown* exposure, not zero exposure. Supply an explicit zero entry (the allocator's `exposureSnapshotCovering` builds one for a declared key set). |
-| `RISK_SCOPE_KEY_MISSING` | A scope cap is configured for a dimension the market carries no attribution for. |
 
-Every entry consumes a limit from **both** components — resting open orders and
-held positions — and this package **recomputes** their sum rather than reading
-the `combined` field the allocator also publishes, so a drifted derived field
-cannot pass a limit.
+The per-scope and global exposure caps are the capital allocator's (C1-RISK,
+the user's ruling of 2026-10-08, recorded at handoff §9.8 check 15). The
+allocator counts open orders, positions, reservations and unbooked fills, and
+its refusal reaches this package as `RISK_ALLOCATION_REFUSED` with the
+allocator's `CAPITAL_*` code in `details.allocatorCodes`.
 
 ### Check 16 — the PRIMARY measure
 
@@ -664,7 +680,13 @@ These four are exactly `PRIMARY_RISK_REASON_CODES`.
 | --- | --- |
 | `RISK_SCENARIO_LOSS_EXCEEDED` | The worst supplied scenario exceeds `scenario.maxScenarioLoss`. |
 | `RISK_SCENARIO_MISSING` | A required shock kind (`SPOT`, `VOLATILITY`, `TIME`, `LIQUIDITY`) was not supplied. |
-| `RISK_SCENARIO_MARKS_INCOMPLETE` | A supplied scenario does not mark every held market; a partial mark understates the loss. |
+
+A market a scenario does not mark is valued at `0`: its whole committed cost
+counts as loss, the contractual floor check 16 uses (C1-RISK; ADR-030 Rule 8
+item 2, note of 2026-10-08). So whenever `maxScenarioLoss` is at least
+`maxWorstCaseContractualLoss`, check 17 refuses nothing check 16 admits
+(pinned by `test/unit/risk/scenario-domination.test.ts`). No rule orders the
+two limits: a tighter `maxScenarioLoss` is a legitimate configuration.
 
 ### Checks 18–20 — guards, headroom, close
 
@@ -691,16 +713,7 @@ These four are exactly `PRIMARY_RISK_REASON_CODES`.
 | `RISK_CANCEL_ALWAYS_PERMITTED` | Approved as a safety cancellation (§6 invariant 13). |
 | `RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE` | Approved as a reduction; capacity, edge, and time gates do not apply. |
 
-### Resize
-
-| Code | Meaning |
-| --- | --- |
-| `RISK_RESIZE_NOT_A_REDUCTION` | A risk resize must strictly reduce `|targetShares|`. |
-| `RISK_RESIZE_ID_REUSED` | The new record reused an id from the lineage; that would edit, not create. |
-| `RISK_RESIZE_UNSUPPORTED_TYPE` | Only `POSITION` and `REDUCE_POSITION` carry a single resizable `targetShares`. |
-| `RISK_RESIZE_INCOHERENT` | The resize would flip the side of the original intent. |
-
-## 6. Approved-intent records and resize lineage
+## 6. Approved-intent records and their lineage fields
 
 | Field | Meaning |
 | --- | --- |
@@ -711,25 +724,16 @@ These four are exactly `PRIMARY_RISK_REASON_CODES`.
 | `sourceIntentId` | The strategy's own `intentId`. Absent for `CANCEL` and `REDUCE_POSITION`, which §7.7 gives none. |
 | `worstCaseBasis` | `EVALUATED` (computed for this intent) or `INHERITED_UPPER_BOUND` (carried from the record being resized). |
 
-Records are deeply frozen: an in-place edit **throws**. A resize returns a new
-record and leaves the original untouched. Freezing happens **inside**
+Every record this package emits is an `ORIGINAL` with an `EVALUATED` worst
+case: the resize path was deleted by C1-RISK (§1). The lineage fields stay,
+because they are a stored contract the execution planner reads.
+
+Records are deeply frozen: an in-place edit **throws**. Freezing happens **inside**
 `sealApprovedIntentRecord` (§4.3), so "emit a record" and "validate the record
 being emitted" are one act rather than two conventions — and since round 4 the
 value emitted is the *materialized* one (§4.4), so "deeply frozen" means the
 record cannot be changed through a prototype or a getter either, not merely that
 `Object.freeze` was called on it.
-
-`resizeApprovedIntent`'s `record` argument is INPUT, not a trusted value: it is
-read into plain own data (§4.4), checked for ADR-016 §2 violations in full, and
-parsed against `ApprovedIntentRecordSchema` — including its `intent` against the
-frozen §7.7 contract — before anything is built. The returned record shares no
-object with it, so a caller cannot reach into a record it was given back.
-
-Ceilings the strategy set (`maximumTotalCost`, `maximumBuyPrice`,
-`minimumSellPrice`, `validUntil`) are copied unchanged by a resize — a ceiling
-stays valid under a smaller size, and scaling one would be this package
-inventing a number the strategy did not supply. Re-running `evaluateIntent` on a
-resized intent produces a fresh `EVALUATED` record.
 
 ### 6.1 Consuming an emitted record — it has a `null` prototype
 
@@ -811,9 +815,9 @@ collapsed parse door. This package is the target of those rows, never the
 source; the direction is the whole point of them.)* Two consequences, both
 deliberate:
 
-- The **capital-allocator** exposure snapshot and reservation verdict are
-  consumed **structurally**, as loose views (`ExposureSnapshotViewSchema`,
-  `AllocationVerdictViewSchema`). `test/unit/risk/ports.test.ts` pins the port
+- The **capital-allocator** reservation verdict is consumed **structurally**,
+  as a loose view (`AllocationVerdictViewSchema`). (The exposure snapshot view
+  was deleted by C1-RISK.) `test/unit/risk/ports.test.ts` pins the port
   three ways: `tsc`-checked field names, a runtime parse of real allocator
   output, and an end-to-end pass driving a refusal from the allocator's own
   numbers.
@@ -822,7 +826,7 @@ deliberate:
   a workspace package and declares no edge) to assert they still agree.
 
 Small helpers duplicated for the same reason, each with its own tests:
-`deepFreeze` / `uuidShapedNotCanonical` / `ownEntry` (shared with
+`deepFreeze` / `uuidShapedNotCanonical` (shared with
 `packages/capital-allocator`) and `instantMilliseconds` (from
 `packages/settlement`) — the WP-110 precedent.
 

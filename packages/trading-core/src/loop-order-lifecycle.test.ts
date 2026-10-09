@@ -236,7 +236,6 @@ function traderConfig(
       eventStream: "polymarket.normalized",
       consumerId: "trdr-4-order-lifecycle",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

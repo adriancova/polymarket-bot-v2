@@ -93,12 +93,6 @@ const RISK_SURFACE: readonly SurfaceEntry[] = [
     reason: CONTAINED_DOOR,
   },
   {
-    name: "resizeApprovedIntent",
-    classification: "total",
-    probe: () => risk.resizeApprovedIntent(HOSTILE_OBJECT() as never, HOSTILE_OBJECT()),
-    reason: CONTAINED_DOOR,
-  },
-  {
     name: "riskRefusal",
     classification: "total",
     probe: () => risk.riskRefusal("RISK_INPUT_INVALID", "m", HOSTILE_OBJECT() as never),
@@ -193,13 +187,6 @@ const RISK_SURFACE: readonly SurfaceEntry[] = [
     reason: NOT_A_MEASUREMENT,
   },
   {
-    name: "checkExposureLimits",
-    classification: "propagates",
-    probe: () =>
-      risk.checkExposureLimits(HOSTILE_OBJECT() as never, HOSTILE_OBJECT() as never, HOSTILE_OBJECT() as never),
-    reason: NOT_A_MEASUREMENT,
-  },
-  {
     name: "recommendIncidentActions",
     classification: "propagates",
     probe: () => risk.recommendIncidentActions(HOSTILE_OBJECT() as never),
@@ -213,8 +200,6 @@ const RISK_SURFACE: readonly SurfaceEntry[] = [
       "FreshnessObservationSchema",
       "FreshnessPolicySchema",
       "AllocationVerdictViewSchema",
-      "ExposureEntryViewSchema",
-      "ExposureSnapshotViewSchema",
       "MarketContextSchema",
       "PortfolioOpenOrderSchema",
       "PortfolioPositionSchema",
@@ -222,7 +207,6 @@ const RISK_SURFACE: readonly SurfaceEntry[] = [
       "RiskEvaluationInputSchema",
       "ScenarioViewSchema",
       "ScopeAttributionSchema",
-      "ResizeRequestSchema",
     ] as const
   ).map((name) => ({
     name,

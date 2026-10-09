@@ -143,49 +143,40 @@ describe("§9.7 capital allocation — the caps decide", () => {
     expect(permitted.trader.loop.health().execution.fillsObserved).toBe(1);
   });
 
-  it("the §9.8 check-15 exposure snapshot is SUPPLIED, and covers the queried scopes", async () => {
-    // An absent snapshot with a configured cap is `RISK_EXPOSURE_SNAPSHOT_MISSING`
-    // and an absent ENTRY is `RISK_EXPOSURE_ENTRY_MISSING`; both fail closed.
-    // Configuring every scope cap generously proves the snapshot ANSWERS for
-    // each of them rather than merely being present.
-    const run = await driveRecordedRun({
-      config: {
-        ...traderConfig(),
-        riskPolicy: {
-          ...(traderConfig()["riskPolicy"] as Record<string, unknown>),
-          limits: {
-            maxWorstCaseContractualLoss: "1000",
-            globalExposureCap: "1000",
-            perInstanceExposureCap: "1000",
-            perMarketExposureCap: "1000",
-            perSeriesExposureCap: "1000",
-            perUnderlyingExposureCap: "1000",
-            perResolutionWindowExposureCap: "1000",
-          },
-        },
+  it("C1-RISK: a riskPolicy that still states a retired exposure cap is REFUSED at startup, naming allocatorCaps", () => {
+    // The capital allocator is the only exposure-cap authority (the user's
+    // ruling, 2026-10-08). `riskPolicy.limits` is strict, so an old document is
+    // refused loudly rather than silently losing a cap.
+    const config = {
+      ...traderConfig(),
+      riskPolicy: {
+        ...(traderConfig()["riskPolicy"] as Record<string, unknown>),
+        limits: { maxWorstCaseContractualLoss: "1000", globalExposureCap: "1000", perUnderlyingExposureCap: "20" },
       },
-    });
-    const health = run.trader.loop.health();
-    expect(Object.keys(health.risk.refusalsByCode)).not.toContain(
-      "RISK_EXPOSURE_SNAPSHOT_MISSING",
-    );
-    expect(Object.keys(health.risk.refusalsByCode)).not.toContain("RISK_EXPOSURE_ENTRY_MISSING");
-    expect(health.execution.fillsObserved).toBe(1);
+    };
+    expect(() => assembleOrThrow({ config })).toThrow(/^TRADER_RISK_POLICY_REFUSED: /u);
+    expect(() => assembleOrThrow({ config })).toThrow(/riskPolicy\.limits\.globalExposureCap is retired: .*allocatorCaps\.globalAccountCap/u);
+    expect(() => assembleOrThrow({ config })).toThrow(/riskPolicy\.limits\.perUnderlyingExposureCap is retired: .*allocatorCaps\.perUnderlyingCap/u);
+    expect(() => assembleOrThrow({ config })).toThrow(/Unrecognized keys: "globalExposureCap", "perUnderlyingExposureCap"/u);
   });
 
-  it("a configured exposure cap BELOW the entry refuses it — the snapshot is real, not decorative", async () => {
-    const run = await driveRecordedRun({
-      config: {
-        ...traderConfig(),
-        riskPolicy: {
-          ...(traderConfig()["riskPolicy"] as Record<string, unknown>),
-          limits: { maxWorstCaseContractualLoss: "1000", globalExposureCap: "1" },
-        },
-      },
-    });
+  it("C1-RISK: the account cap BELOW the entry refuses it at the risk gate as RISK_ALLOCATION_REFUSED, naming CAPITAL_GLOBAL_CAP_EXCEEDED", async () => {
+    // Was a risk-side `globalExposureCap` of "1" refusing
+    // `RISK_GLOBAL_EXPOSURE_EXCEEDED`. The same limit now lives in the
+    // allocator: one cent under the entry's 17.5 binds it.
+    const run = await driveRecordedRun({ config: withCaps({ globalAccountCap: "17.49" }) });
     const health = run.trader.loop.health();
     expect(health.risk.approvals).toBe(0);
-    expect(Object.keys(health.risk.refusalsByCode)).toContain("RISK_GLOBAL_EXPOSURE_EXCEEDED");
+    expect(health.execution.fillsObserved).toBe(0);
+    expect(Object.keys(health.risk.refusalsByCode)).toEqual(["RISK_ALLOCATION_REFUSED"]);
+    expect(Object.keys(health.seams.allocator.refusalsByCode)).toEqual(["CAPITAL_GLOBAL_CAP_EXCEEDED"]);
+
+    // At the entry's cost exactly, it trades: the cap is compared.
+    const atCost = await driveRecordedRun({ config: withCaps({ globalAccountCap: ENTRY_COST }) });
+    expect(atCost.trader.loop.health().execution.fillsObserved).toBe(1);
+    expect(Object.keys(atCost.trader.loop.health().seams.allocator.refusalsByCode)).not.toContain(
+      "CAPITAL_GLOBAL_CAP_EXCEEDED",
+    );
   });
 
   it("the POSITION a fill creates carries its EXACT cost basis into the next evaluation", async () => {
@@ -206,7 +197,7 @@ describe("§9.7 capital allocation — the caps decide", () => {
  *
  * | Mutation | What it deletes | Killed by |
  * | --- | --- | --- |
- * | A4 (`allocation.ts`) | the LIVE `exposureSnapshotCovering`, replaced by a covered EMPTY snapshot | the RISK probe below |
+ * | A4 (`allocation.ts`) | the LIVE `exposureSnapshotCovering`, replaced by a covered EMPTY snapshot | (moot since C1-RISK: no snapshot reaches risk) |
  * | A7 (`allocation.ts`) | a position's `costBasis`, replaced by `"0"` | the ALLOCATOR probe below |
  *
  * The two markets share `underlyingKey: "BTC"`, and market 1's entry FILLS
@@ -217,13 +208,12 @@ describe("§9.7 capital allocation — the caps decide", () => {
  *
  * - the ALLOCATOR side (§9.7) counts positions through `#positionsFrom`, which
  *   is where A7 lives;
- * - the RISK side (§9.8 check 15) counts them through the exposure SNAPSHOT the
- *   allocator hands the engine, which is where A4 lives.
- *
- * Each probe fixes one number and asserts the other stays free, so neither can
- * pass because of the other's cap.
+ * - the RISK side sees the allocator's refusal through §9.8 check 14
+ *   (`RISK_ALLOCATION_REFUSED`). Until C1-RISK it also re-checked a copy of the
+ *   cap at check 15 over the allocator's snapshot (mutation A4); the user's
+ *   ruling of 2026-10-08 made the allocator the only exposure-cap authority.
  */
-describe("§9.7 / §9.8 check 15 — a HELD POSITION consumes the caps", () => {
+describe("§9.7 / §9.8 check 14 — a HELD POSITION consumes the caps", () => {
   it("the ALLOCATOR's per-underlying cap counts the position market 1 filled", async () => {
     const run = await driveTwoMarketRun(
       capsOn(twoMarketConfig("1000"), { perUnderlyingCap: "20" }),
@@ -259,31 +249,21 @@ describe("§9.7 / §9.8 check 15 — a HELD POSITION consumes the caps", () => {
     expect(run.trader.loop.health().seams.allocator.refusalsByCode).toEqual({});
   });
 
-  it("the RISK engine's per-underlying EXPOSURE cap reads the same position", async () => {
-    const base = twoMarketConfig("1000");
-    const policy = base["riskPolicy"] as Record<string, unknown>;
-    const run = await driveTwoMarketRun({
-      ...base,
-      riskPolicy: {
-        ...policy,
-        limits: {
-          ...(policy["limits"] as Record<string, unknown>),
-          perUnderlyingExposureCap: "20",
-        },
-      },
-    });
+  it("C1-RISK: the per-underlying cap's refusal reaches the risk gate as RISK_ALLOCATION_REFUSED, naming CAPITAL_UNDERLYING_CAP_EXCEEDED", async () => {
+    // Was a risk-side `perUnderlyingExposureCap` of "20" refusing
+    // `RISK_UNDERLYING_EXPOSURE_EXCEEDED` over the allocator's snapshot. The
+    // same cap is the allocator's now, and check 14 binds its verdict.
+    const run = await driveTwoMarketRun(
+      capsOn(twoMarketConfig("1000"), { perUnderlyingCap: "20" }),
+    );
     const health = run.trader.loop.health();
 
     expect(health.execution.fillsObserved).toBe(1);
-    expect(Object.keys(health.risk.refusalsByCode)).toContain(
-      "RISK_UNDERLYING_EXPOSURE_EXCEEDED",
-    );
-    // The ALLOCATOR permitted it — this refusal is check 15 reading the
-    // snapshot, so an all-zero snapshot would approve the second entry.
-    expect(health.seams.allocator.refusalsByCode).toEqual({});
-    expect(Object.keys(health.risk.refusalsByCode)).not.toContain(
-      "RISK_EXPOSURE_ENTRY_MISSING",
-    );
+    expect(Object.keys(health.risk.refusalsByCode)).toEqual(["RISK_ALLOCATION_REFUSED"]);
+    expect(health.risk.refusalsByCode["RISK_ALLOCATION_REFUSED"]).toBe(1);
+    expect(Object.keys(health.seams.allocator.refusalsByCode)).toEqual([
+      "CAPITAL_UNDERLYING_CAP_EXCEEDED",
+    ]);
   });
 });
 

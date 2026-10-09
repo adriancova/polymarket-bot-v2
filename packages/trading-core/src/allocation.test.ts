@@ -181,6 +181,23 @@ describe("the FIFO cost-basis book", () => {
   });
 });
 
+/**
+ * What the cap check counts for the instance (`AllocatorGate.countedExposure`,
+ * the read the `CAP-1` pins use; until C1-RISK it rode on every `evaluate`).
+ */
+function counted(subject: AllocatorGate, viewOf: OrderViewOf): string {
+  const snapshot = subject.countedExposure({
+    liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+    projection: EMPTY_PROJECTION,
+    availableCollateral: "1000",
+    viewOf,
+  });
+  if (snapshot === undefined) return "unbuildable";
+  return Object.hasOwn(snapshot.byStrategyInstance, INSTANCE)
+    ? (snapshot.byStrategyInstance[INSTANCE]?.combined ?? "missing")
+    : "0";
+}
+
 describe("the allocator gate", () => {
   it("PERMITS a commitment inside the caps, and the verdict carries no refusals", () => {
     const outcome = evaluate(gate(), buyIntent());
@@ -200,6 +217,63 @@ describe("the allocator gate", () => {
     );
   });
 
+  it("C1-RISK: a multi-leg intent is judged on the SUM of its legs, not leg by leg", () => {
+    // The capital allocator is the only exposure-cap authority (the user's
+    // ruling, 2026-10-08). Each leg here costs 17.5 and fits the 30 caps on its
+    // own; together they commit 35, which exceeds both. Judging each leg
+    // against the same base state, as `evaluate` did before C1-RISK, permits
+    // this intent, and only the plan-time `applyForPlan` refused it.
+    const basket = {
+      type: "BASKET",
+      intentId: "basket-0",
+      legs: [
+        { marketId: MARKET, direction: "YES", targetShares: "50", maximumBuyPrice: "0.35" },
+        { marketId: MARKET, direction: "NO", targetShares: "50", maximumBuyPrice: "0.35" },
+      ],
+      maximumCombinedCost: "35",
+      minimumLockedEdge: "0",
+      legRiskLimit: "35",
+      failurePolicy: "ABANDON",
+      validUntil: "2026-03-04T12:00:30Z",
+    } as unknown as Intent;
+    const outcome = evaluate(gate({ globalAccountCap: "30", perMarketCap: "30" }), basket);
+    expect(outcome.requests).toHaveLength(2);
+    expect(outcome.verdict?.permitted).toBe(false);
+    const codes = outcome.verdict?.refusals.map((refusal) => refusal.code) ?? [];
+    expect(codes).toContain("CAPITAL_MARKET_CAP_EXCEEDED");
+    expect(codes).toContain("CAPITAL_GLOBAL_CAP_EXCEEDED");
+
+    // Each leg alone fits: the refusal above is the sum's, not one leg's.
+    for (const direction of ["YES", "NO"] as const) {
+      const single = evaluate(gate({ globalAccountCap: "30", perMarketCap: "30" }), {
+        ...buyIntent(),
+        direction,
+      } as unknown as Intent);
+      expect(single.verdict?.permitted).toBe(true);
+    }
+    // And the sum at the caps' edge (17.5 + 12.5 = 30) is admitted.
+    const atEdge = evaluate(gate({ globalAccountCap: "30", perMarketCap: "30" }), {
+      ...basket,
+      legs: [
+        { marketId: MARKET, direction: "YES", targetShares: "50", maximumBuyPrice: "0.35" },
+        { marketId: MARKET, direction: "NO", targetShares: "50", maximumBuyPrice: "0.25" },
+      ],
+    } as unknown as Intent);
+    expect(atEdge.verdict?.permitted).toBe(true);
+  });
+
+  it("C1-RISK r1: perResolutionWindowCap binds on the market's resolution window, at its edge", () => {
+    // Risk's copy of this cap (check 15) was deleted by C1-RISK; this is now
+    // its only pin. The BUY commits 50 x 0.35 = 17.5 in SCOPE's window.
+    const atCap = evaluate(gate({ perResolutionWindowCap: "17.5" }), buyIntent());
+    expect(atCap.verdict?.permitted).toBe(true);
+    const over = evaluate(gate({ perResolutionWindowCap: "17.49" }), buyIntent());
+    expect(over.verdict?.permitted).toBe(false);
+    expect(over.verdict?.refusals.map((refusal) => refusal.code)).toEqual([
+      "CAPITAL_RESOLUTION_WINDOW_CAP_EXCEEDED",
+    ]);
+  });
+
   it("REFUSES a LIVE commitment on a market with no recorded owner (ADR-011)", () => {
     const outcome = evaluate(gate(), buyIntent(), { owners: [] });
     expect(outcome.verdict?.permitted).toBe(false);
@@ -215,20 +289,6 @@ describe("the allocator gate", () => {
     expect(outcome.requests).toEqual([]);
   });
 
-  it("the exposure snapshot ANSWERS for every scope the evaluation queries", () => {
-    const outcome = evaluate(gate(), buyIntent());
-    // An ABSENT entry is what `RISK_EXPOSURE_ENTRY_MISSING` refuses, so each of
-    // these must be PRESENT — as an explicit zero on an empty account.
-    expect(Object.hasOwn(outcome.exposures.byStrategyInstance, INSTANCE)).toBe(true);
-    expect(Object.hasOwn(outcome.exposures.byMarket, MARKET)).toBe(true);
-    expect(Object.hasOwn(outcome.exposures.bySeries, SCOPE.seriesKey)).toBe(true);
-    expect(Object.hasOwn(outcome.exposures.byUnderlying, SCOPE.underlyingKey)).toBe(true);
-    expect(Object.hasOwn(outcome.exposures.byResolutionWindow, SCOPE.resolutionWindowKey)).toBe(
-      true,
-    );
-    expect(outcome.exposures.global.combined).toBe("0");
-  });
-
   it("the SHADOW arm is the package's, and the TRADER never asks for it", () => {
     // What the arm DOES: no live owner is needed, and the caps are compared
     // against the instance's own shadow book instead of the account.
@@ -237,7 +297,6 @@ describe("the allocator gate", () => {
       owners: [],
     });
     expect(outcome.verdict?.permitted).toBe(true);
-    expect(Object.hasOwn(outcome.exposures.byMarket, MARKET)).toBe(true);
     expect(outcome.requests[0]?.accountingMode).toBe("SHADOW");
 
     // WHY THAT IS DANGEROUS FOR THIS PROCESS, and why `loop.ts` passes a
@@ -390,10 +449,7 @@ describe("CAP-1: a commitment is converted, never released, as its fills are see
 
   /** What the cap check counts for the instance — the commitment alone (the projection is empty). */
   function countedFor(subject: AllocatorGate): string {
-    return (
-      evaluate(subject, { type: "CANCEL", marketId: MARKET, reason: "read" } as unknown as Intent).exposures
-        .byStrategyInstance[INSTANCE]?.combined ?? "missing"
-    );
+    return counted(subject, NO_VIEW);
   }
 
   it("a BOOKED fill converts its shares: the commitment holds the reservation less the fill's debit, its better price still reserved", () => {
@@ -680,10 +736,7 @@ describe("CAP-1 r1: the final size is judged where the evaluation can see it", (
   const seenFill = { simulatedFillId: "f-r1", marketId: MARKET, side: "YES" as const, action: "BUY" as const, price: "0.34", shares: "5" };
 
   function countedFor(subject: AllocatorGate, viewOf: OrderViewOf): string {
-    return (
-      evaluate(subject, { type: "CANCEL", marketId: MARKET, reason: "read" } as unknown as Intent, { viewOf }).exposures
-        .byStrategyInstance[INSTANCE]?.combined ?? "missing"
-    );
+    return counted(subject, viewOf);
   }
 
   it("an UNSETTLED commitment whose order the view shows TERMINAL is counted at its final size — 5 seen at 0.34 = 1.70, its 1.80 unused remainder released — and the question moves nothing", () => {
@@ -881,9 +934,8 @@ describe("an intent the allocator cannot price is REFUSED downstream", () => {
         positions: [],
         openOrders: [],
         unbookedFills: [],
-        // The allocator's OWN answers, passed through exactly as `loop.ts`
-        // passes them. Nothing is fabricated for the absent case.
-        exposures: allocation.exposures,
+        // The allocator's OWN answer, passed through exactly as `loop.ts`
+        // passes it. Nothing is fabricated for the absent case.
         allocation: allocation.verdict,
         recentIntentIds: [],
         availableRequests: 100,

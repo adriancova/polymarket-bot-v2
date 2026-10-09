@@ -264,7 +264,6 @@ function singleMarketConfig(options: ConfigOptions = {}): Record<string, unknown
       eventStream: "polymarket.normalized",
       consumerId: "throughput-1c-book-freshness",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

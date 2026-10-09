@@ -75,7 +75,6 @@ function validConfig(): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "trader-1",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100000,
     },
     markets: [
       {

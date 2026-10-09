@@ -394,7 +394,6 @@ export function traderConfig(
       eventStream: "polymarket.normalized",
       consumerId: "wp250-e2e",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

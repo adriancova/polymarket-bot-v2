@@ -9,8 +9,8 @@
  * silently pass — the absence is itself a refusal (`*_UNKNOWN`, `*_MISSING`).
  *
  * FAIL CLOSED IS THE WHOLE DESIGN. Unknown never permits. A missing market
- * context, an unmeasured feed, an unsupplied exposure snapshot, an unsupplied
- * allocator verdict, an unbounded cost, a missing scenario — each blocks.
+ * context, an unmeasured feed, an unsupplied allocator verdict, an unbounded
+ * cost, a missing scenario — each blocks.
  *
  * WORST-CASE CONTRACTUAL LOSS IS PRIMARY (§9.8 primary measures; workplan
  * acceptance 2). Two structural consequences, not one comment:
@@ -57,20 +57,13 @@ import { addDecimal, compareDecimal, isTickConformant, subDecimal } from "@polym
 import {
   RUN_MODE_PLACES_REAL_ORDERS,
   runModeExceeds,
-  type MoneyString,
   type SharesString,
 } from "@polymarket-bot/domain";
 
 import { sealApprovedIntentRecord, type ApprovedIntentRecord } from "./approved-intent.js";
-import { checkExposureLimits } from "./exposure-limits.js";
 import { assessFreshness, blocksAsStale, type FreshnessAssessment } from "./freshness.js";
 import { deepFreeze, ownFlag } from "./guards.js";
-import {
-  validateEvaluationInput,
-  type MarketContext,
-  type RiskEvaluationInput,
-  type ScopeAttribution,
-} from "./inputs.js";
+import { validateEvaluationInput, type MarketContext, type RiskEvaluationInput } from "./inputs.js";
 import { buildIntentView, heldShares, type IntentLeg } from "./intent-view.js";
 import { buildWorstCaseLots } from "./lots.js";
 import type { RiskPolicy } from "./policy.js";
@@ -338,10 +331,6 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     }
     appendData(contexts, context);
   }
-
-  const scopeByMarket = new Map<string, ScopeAttribution | undefined>(
-    contexts.map((context) => [context.marketId, context.scope]),
-  );
 
   for (const context of contexts) {
     // --- §9.8 check 5: market active and accepting orders ------------------
@@ -742,49 +731,33 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     }
   }
 
-  // --- §9.8 check 15: per-order, per-scope, and global limits --------------
+  // --- §9.8 check 15: per-order limit -------------------------------------
   // Capacity limits gate ENTRIES. An exit REDUCES exposure, so enforcing a cap
   // against it would block exactly the action that brings the account back
-  // inside the cap.
-  const perMarketContribution = new Map<string, MoneyString>();
-  // An UNBOUNDED leg has no cost to compare against a cap, and a zero is not a
-  // conservative stand-in for one. `view.boundedCost === undefined` and an
-  // unbounded leg are the same condition (`intent-view.ts`), and it is already
-  // refused as `RISK_WORST_CASE_UNBOUNDED` at check 16 — so the intent never
-  // passes on the strength of a skipped capacity check.
-  let anyLegUnbounded = false;
-  for (const legs of legsByMarket.values()) {
-    if (legs.some((leg) => leg.boundedCost === undefined)) anyLegUnbounded = true;
-  }
-  if (isEntry && view.boundedCost !== undefined && !anyLegUnbounded) {
-    for (const [marketId, legs] of legsByMarket) {
-      let contribution: MoneyString = "0";
-      for (const leg of legs) {
-        // Narrowed by `anyLegUnbounded` above; never defaulted to "0".
-        if (leg.boundedCost === undefined) continue;
-        contribution = addDecimal(contribution, leg.boundedCost);
-      }
-      perMarketContribution.set(marketId, contribution);
-    }
-    if (policy.limits.maxOrderNotional !== undefined) {
-      if (compareDecimal(view.boundedCost, policy.limits.maxOrderNotional) > 0) {
-        appendData(
-          accumulator.refusals,
-          riskRefusal(
-            "RISK_PER_ORDER_NOTIONAL_EXCEEDED",
-            "the intent's bounded notional exceeds the per-order notional limit",
-            { boundedCost: view.boundedCost, maxOrderNotional: policy.limits.maxOrderNotional },
-          ),
-        );
-      }
-    }
-    const exposureRefusals = checkExposureLimits(policy.limits, data.exposures, {
-      strategyInstanceId: data.context.strategyInstanceId,
-      perMarketContribution,
-      scopeByMarket,
-      totalContribution: view.boundedCost,
-    });
-    for (const refusal of exposureRefusals) appendData(accumulator.refusals, refusal);
+  // inside the cap. An UNBOUNDED intent (`view.boundedCost === undefined`) has
+  // no notional to compare, and it is refused `RISK_WORST_CASE_UNBOUNDED` at
+  // check 16, so it never passes on the strength of a skipped comparison.
+  //
+  // THE PER-SCOPE AND GLOBAL LIMITS are the capital allocator's (C1-RISK,
+  // EXPO-CAPS; the user's ruling, 2026-10-08, recorded at handoff §9.8 check
+  // 15). It is the only exposure-cap authority: its verdict binds here through
+  // check 14 (`RISK_ALLOCATION_REFUSED`), and it re-judges at plan time before
+  // anything is submitted. This package kept a second copy of the same six
+  // caps over the allocator's own snapshot until then.
+  if (
+    isEntry &&
+    view.boundedCost !== undefined &&
+    policy.limits.maxOrderNotional !== undefined &&
+    compareDecimal(view.boundedCost, policy.limits.maxOrderNotional) > 0
+  ) {
+    appendData(
+      accumulator.refusals,
+      riskRefusal(
+        "RISK_PER_ORDER_NOTIONAL_EXCEEDED",
+        "the intent's bounded notional exceeds the per-order notional limit",
+        { boundedCost: view.boundedCost, maxOrderNotional: policy.limits.maxOrderNotional },
+      ),
+    );
   }
 
   // --- §9.8 check 16: worst-case contractual loss — PRIMARY ----------------
@@ -881,16 +854,6 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
               missingKinds: scenario.missingKinds,
               requiredKinds: policy.scenario.requiredKinds,
             },
-          ),
-        );
-      }
-      if (scenario.incompleteScenarioIds.length > 0) {
-        appendData(
-          accumulator.refusals,
-          riskRefusal(
-            "RISK_SCENARIO_MARKS_INCOMPLETE",
-            "a supplied scenario does not mark every market the account holds; a partially-marked portfolio understates the loss",
-            { incompleteScenarioIds: scenario.incompleteScenarioIds },
           ),
         );
       }

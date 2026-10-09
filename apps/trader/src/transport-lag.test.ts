@@ -96,8 +96,9 @@ describe("sampleFromMetrics — the positions one metrics read implies", () => {
       consumerPosition: 750,
       committedPosition: 710,
       entriesBehindHead: 250,
-      retentionMaxEvents: 5_000,
     });
+    // C1-RISK (OPS-07): the queue's `maximumDepth` (5,000 here) is the inert
+    // ceiling the trader connects with, not the stream's retention: not read.
   });
 
   it("never reports a negative position", () => {

@@ -51,13 +51,13 @@ export const RiskPolicySchema = z.strictObject({
     maxWorstCaseContractualLoss: NonNegativeMoneyStringSchema,
     /** Optional cap on the verified-outcome measure (§9.8 "worst-case resolution PnL"). */
     maxWorstCaseResolutionLoss: NonNegativeMoneyStringSchema.optional(),
+    /** §9.8 check 15: the per-order notional limit. */
     maxOrderNotional: NonNegativeMoneyStringSchema.optional(),
-    globalExposureCap: NonNegativeMoneyStringSchema.optional(),
-    perInstanceExposureCap: NonNegativeMoneyStringSchema.optional(),
-    perMarketExposureCap: NonNegativeMoneyStringSchema.optional(),
-    perSeriesExposureCap: NonNegativeMoneyStringSchema.optional(),
-    perUnderlyingExposureCap: NonNegativeMoneyStringSchema.optional(),
-    perResolutionWindowExposureCap: NonNegativeMoneyStringSchema.optional(),
+    // No per-scope or global exposure cap lives here (C1-RISK, 2026-10-08):
+    // the capital allocator's caps are the only exposure-cap authority, and its
+    // verdict binds at check 14. `limits` is STRICT, so a policy that still
+    // states one of the six retired `*ExposureCap` fields is refused, loudly,
+    // rather than silently losing a cap.
   }),
 
   scenario: z.strictObject({
@@ -177,7 +177,7 @@ export function parseRiskPolicy(input: unknown): RiskResult<RiskPolicy> {
       // THE VALIDATED POLICY IS THE MATERIALIZED TREE (review round 7). The
       // parse answered the QUESTION; its output object is not read. `read.value`
       // is own data with no prototype, so an ABSENT OPTIONAL LIMIT
-      // (`limits.perMarketExposureCap`, `economics.minOrderNotional`,
+      // (`limits.maxOrderNotional`, `economics.minOrderNotional`,
       // `participation.maxOrderShares`) stays absent for every read downstream
       // instead of being answered by `Object.prototype`, and a limit the caller
       // DID configure can no longer vanish in the library's output assembly.

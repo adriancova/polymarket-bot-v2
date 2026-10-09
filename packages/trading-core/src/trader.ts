@@ -207,6 +207,39 @@ function detailIssues(details: unknown): readonly string[] {
 }
 
 /**
+ * C1-RISK (the user's ruling, 2026-10-08): the six per-scope exposure caps
+ * `riskPolicy.limits` used to carry, and the `allocatorCaps` field that states
+ * each now. The capital allocator is the only exposure-cap authority, and
+ * `packages/risk`'s `limits` is strict, so a configuration still naming one is
+ * refused at startup. This table only makes that refusal say where the cap
+ * went; it accepts nothing.
+ */
+const RETIRED_RISK_EXPOSURE_CAPS: Readonly<Record<string, string>> = Object.freeze({
+  globalExposureCap: "globalAccountCap",
+  perInstanceExposureCap: "perStrategyCap",
+  perMarketExposureCap: "perMarketCap",
+  perSeriesExposureCap: "perSeriesCap",
+  perUnderlyingExposureCap: "perUnderlyingCap",
+  perResolutionWindowExposureCap: "perResolutionWindowCap",
+});
+
+/** One line per retired cap the document's `riskPolicy.limits` still states, naming its `allocatorCaps` field. */
+function retiredExposureCapIssues(riskPolicy: unknown): readonly string[] {
+  // The configuration is the door's materialized tree: own data, no accessor.
+  if (typeof riskPolicy !== "object" || riskPolicy === null || !Object.hasOwn(riskPolicy, "limits")) return [];
+  const limits = (riskPolicy as Record<string, unknown>)["limits"];
+  if (typeof limits !== "object" || limits === null) return [];
+  return Object.keys(RETIRED_RISK_EXPOSURE_CAPS)
+    .filter((name) => Object.hasOwn(limits, name))
+    .map(
+      (name) =>
+        `riskPolicy.limits.${name} is retired: the capital allocator is the only exposure-cap ` +
+        `authority (C1-RISK, 2026-10-08), so state this cap as allocatorCaps.` +
+        `${RETIRED_RISK_EXPOSURE_CAPS[name] ?? "?"} and delete it from riskPolicy.limits`,
+    );
+}
+
+/**
  * Builds a PAPER trader, or refuses.
  *
  * TOTAL: never throws. A composition root that threw on a bad configuration
@@ -237,10 +270,13 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     return refuse(
       "TRADER_RISK_POLICY_REFUSED",
       "the §9.8 risk policy was refused by packages/risk's own door",
-      policy.refusals.flatMap((refusal_) => [
-        `${refusal_.code}: ${refusal_.message}`,
-        ...detailIssues(refusal_.details),
-      ]),
+      [
+        ...retiredExposureCapIssues(config.riskPolicy),
+        ...policy.refusals.flatMap((refusal_) => [
+          `${refusal_.code}: ${refusal_.message}`,
+          ...detailIssues(refusal_.details),
+        ]),
+      ],
     );
   }
   const caps = parseAllocatorCaps(config.allocatorCaps);

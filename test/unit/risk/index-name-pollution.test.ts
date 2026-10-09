@@ -40,8 +40,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { resizeApprovedIntent } from "../../../packages/risk/src/approved-intent.js";
-import { checkExposureLimits } from "../../../packages/risk/src/exposure-limits.js";
+import { sealApprovedIntentRecord } from "../../../packages/risk/src/approved-intent.js";
 import { assessFreshness } from "../../../packages/risk/src/freshness.js";
 import {
   RiskEvaluationInputSchema,
@@ -63,13 +62,11 @@ import {
 } from "../../../packages/risk/src/worst-case.js";
 import { evaluateIntent } from "../../../packages/risk/src/index.js";
 import {
-  INSTANCE,
   MARKET_A,
   MARKET_B,
   allScenarios,
   entryInput,
   exitInput,
-  exposureSnapshot,
   freshObservations,
   position,
   positionIntent,
@@ -274,6 +271,13 @@ const DOORS: readonly Door[] = [
  *   exposure-limits  5         checkExposureLimits        refusals
  *   inputs           1         validateEvaluationInput    refusals
  *   approved-intent  8         resizeApprovedIntent       refusals
+ *
+ * C1-RISK (2026-10-08) deleted `exposure-limits.ts`, the resize path and
+ * `scenario.ts`'s one append (an unmarked lot is valued at 0 rather than
+ * listed). The `exposure-limits` row went with its module; the
+ * `approved-intent` row now drives the emission boundary
+ * (`sealApprovedIntentRecord`), whose refusal accumulator remains; the
+ * `scenario` row stays, over the outcomes it maps.
  *   schema-arena     1         prototypeFreeParser        items (a def slot's array)
  *   engine          47         evaluateIntent             refusals, recommendations, contexts, reasons, legs
  * ```
@@ -320,36 +324,6 @@ const MODULE_DOORS: readonly Door[] = [
     name: "scenario.assessScenarios",
     run: () => assessScenarios(allScenarios() as never, lotsFixture(), []),
   },
-  {
-    // A SPARSE snapshot, deliberately: the absent-snapshot arm returns an array
-    // LITERAL and never touches the accumulator, so a probe built on it would
-    // measure nothing. A snapshot that is present but does not measure the
-    // queried scopes drives `entryMissing` through the module's own `push`
-    // helper — the five converted sites.
-    name: "exposure-limits.checkExposureLimits(sparse snapshot)",
-    run: () =>
-      checkExposureLimits(
-        riskPolicy({
-          limits: {
-            maxWorstCaseContractualLoss: "10000",
-            globalExposureCap: "500",
-            perInstanceExposureCap: "500",
-            perMarketExposureCap: "500",
-            perSeriesExposureCap: "500",
-          },
-        }).limits,
-        exposureSnapshot() as never,
-        {
-          strategyInstanceId: INSTANCE,
-          perMarketContribution: new Map([
-            [MARKET_A, "10" as never],
-            [MARKET_B, "10" as never],
-          ]),
-          scopeByMarket: new Map([[MARKET_A, { seriesKey: "btc-15m" } as never]]),
-          totalContribution: "20" as never,
-        },
-      ),
-  },
 ];
 
 /**
@@ -367,7 +341,7 @@ const ZOD_BOUNDED_DOORS: readonly Door[] = [
     name: "inputs.validateEvaluationInput(refusing)",
     run: () => validateEvaluationInput({ intent: 1 }),
   },
-  { name: "approved-intent.resizeApprovedIntent(refusing)", run: () => resizeFixture() },
+  { name: "approved-intent.sealApprovedIntentRecord(refusing)", run: () => sealFixture() },
 ];
 
 /** `buildWorstCaseLots` on a portfolio that holds both markets. */
@@ -386,17 +360,13 @@ function lotsFixture(): readonly MarketHoldingLot[] {
 }
 
 /**
- * `resizeApprovedIntent` on a HAND-BUILT record that refuses — the shape that
+ * The emission boundary on a HAND-BUILT record that refuses — the shape that
  * drives `approved-intent.ts`'s refusal accumulator without needing the engine
- * to approve first (which would make the row a composite probe again).
+ * to approve first (which would make the row a composite probe again). It
+ * drove `resizeApprovedIntent` until C1-RISK deleted that path.
  */
-function resizeFixture(): unknown {
-  return resizeApprovedIntent({ lineage: "ORIGINAL" } as never, {
-    approvedIntentId: "01890000-0000-7000-8000-0000000000ab",
-    resizedAt: "2026-09-03T12:00:01.000Z",
-    newTargetShares: "50",
-    reason: "shrink",
-  });
+function sealFixture(): unknown {
+  return sealApprovedIntentRecord({ lineage: "ORIGINAL" } as never);
 }
 
 /**
@@ -595,7 +565,6 @@ describe("THE BOUND at an index name: neither permission nor availability varies
     const named = [...MODULE_DOORS, ...ZOD_BOUNDED_DOORS].map((door) => door.name.split(".")[0]);
     expect([...new Set(named)].sort()).toEqual([
       "approved-intent",
-      "exposure-limits",
       "freshness",
       "inputs",
       "intent-view",

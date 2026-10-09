@@ -59,7 +59,7 @@ import {
   ManualGatewayClock,
   ManualGatewayTimers,
 } from "@polymarket-bot/data-gateway/testing";
-import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
+import { MAX_RETENTION_EVENTS, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
@@ -307,7 +307,7 @@ describe("UNIV-4 acceptance (c) — the trader opens a market from the gateway's
       // The process's own feed over the process's own transport binding.
       const traderTransport = await RedisStreamsEventTransport.connect({
         connection: { url: redis.getConnectionUrl() },
-        retention: { maxEvents: parsed.config.infrastructure.retentionMaxEvents },
+        retention: { maxEvents: MAX_RETENTION_EVENTS },
       });
       const subscription = await traderTransport.subscribe({
         stream: parsed.config.infrastructure.eventStream,
@@ -399,7 +399,7 @@ describe("UNIV-4 acceptance (c) — the trader opens a market from the gateway's
       const { trader, store } = assembled;
       const traderTransport = await RedisStreamsEventTransport.connect({
         connection: { url: redis.getConnectionUrl() },
-        retention: { maxEvents: parsed.config.infrastructure.retentionMaxEvents },
+        retention: { maxEvents: MAX_RETENTION_EVENTS },
       });
       const subscription = await traderTransport.subscribe({
         stream: parsed.config.infrastructure.eventStream,

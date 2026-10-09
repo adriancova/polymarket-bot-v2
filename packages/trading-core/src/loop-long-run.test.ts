@@ -231,7 +231,6 @@ function traderConfig(options: HarnessOptions = {}): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "trdr-4-long-run",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

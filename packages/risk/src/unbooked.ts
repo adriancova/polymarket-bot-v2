@@ -51,14 +51,13 @@ export interface ComparedScenarioLoss {
 }
 
 /**
- * Check 17's compared worst loss: the worst over the scenarios usable WITH the
- * unbooked fills, never below the booked-only worst.
+ * Check 17's compared worst loss: the worst WITH the unbooked fills, never
+ * below the booked-only worst.
  *
- * When NO scenario can mark the lot set with the unbooked fills (one sits in a
- * market no scenario marks), the booked-only worst is compared as it was — so
- * a `RISK_SCENARIO_LOSS_EXCEEDED` the booked-only measure earns is never
- * traded for the `RISK_SCENARIO_MARKS_INCOMPLETE` the unmarked lot adds: both
- * refuse. `undefined` only when neither lot set can be marked at all.
+ * Both assessments mark the same scenarios, and an unmarked lot is valued at
+ * `0` (C1-RISK), so both worst losses are defined exactly when a scenario was
+ * supplied. `undefined` only when none was, and `RISK_SCENARIO_MISSING` then
+ * refuses the entry.
  */
 export function comparedScenarioLoss(
   withUnbooked: ScenarioAssessment,
@@ -66,8 +65,7 @@ export function comparedScenarioLoss(
 ): ComparedScenarioLoss {
   const measured = withUnbooked.worstLoss;
   const floor = bookedOnly.worstLoss;
-  if (measured === undefined) return { worstLoss: floor, worstScenarioId: bookedOnly.worstScenarioId };
-  if (floor !== undefined && compareDecimal(floor, measured) > 0) {
+  if (measured !== undefined && floor !== undefined && compareDecimal(floor, measured) > 0) {
     return { worstLoss: floor, worstScenarioId: bookedOnly.worstScenarioId };
   }
   return { worstLoss: measured, worstScenarioId: withUnbooked.worstScenarioId };

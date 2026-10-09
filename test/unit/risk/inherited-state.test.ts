@@ -99,7 +99,6 @@ import { deepFreeze as riskDeepFreeze } from "../../../packages/risk/src/guards.
 import {
   evaluateIntent,
   parseRiskPolicy,
-  resizeApprovedIntent,
   validateEvaluationInput,
 } from "../../../packages/risk/src/index.js";
 import { RISK_POLICY_DEFAULTS } from "../../../packages/risk/src/policy.js";
@@ -108,13 +107,9 @@ import {
   codesOf,
   entryInput,
   exitInput,
-  EVALUATED_AT,
-  FIXTURE_MEASURING,
   INSTANCE,
   MARKET_A,
   MARKET_B,
-  exposureEntry,
-  exposureSnapshot as exposureSnapshotFixture,
   riskPolicy,
 } from "./fixtures.js";
 
@@ -790,41 +785,6 @@ const POLICY_INPUT = {
   timeToClose: { entryCutoffSeconds: 60 },
 };
 
-/** An entry whose §9.8 check 15 path is fully exercised: caps AND a snapshot. */
-function exposureInput(): ReturnType<typeof entryInput> {
-  const input = entryInput();
-  input.exposures = exposureSnapshotFixture({
-    byMarket: { [MARKET_A]: exposureEntry("10", "10") },
-    measuring: FIXTURE_MEASURING,
-  });
-  return input;
-}
-
-const EXPOSURE_POLICY = riskPolicy({
-  limits: {
-    maxWorstCaseContractualLoss: "10000",
-    globalExposureCap: "10000",
-    perInstanceExposureCap: "10000",
-    perMarketExposureCap: "10000",
-    perSeriesExposureCap: "10000",
-    perUnderlyingExposureCap: "10000",
-    perResolutionWindowExposureCap: "10000",
-  },
-});
-
-function approvedRecord(): Record<string, unknown> {
-  const evaluation = evaluateIntent(riskPolicy(), entryInput());
-  if (!evaluation.approved) throw new Error(JSON.stringify(codesOf(evaluation)));
-  return structuredClone(evaluation.record) as unknown as Record<string, unknown>;
-}
-
-const RESIZE_REQUEST = {
-  approvedIntentId: "approved-2",
-  resizedAt: EVALUATED_AT,
-  newTargetShares: "50",
-  reason: "risk reduction",
-};
-
 // Every input is built HERE, at module scope, outside any polluted window.
 const POLICY = riskPolicy();
 const ENTRY = entryInput();
@@ -834,19 +794,12 @@ const CANCEL = (() => {
   input.intent = cancelIntent();
   return input;
 })();
-const EXPOSURE_ENTRY_INPUT = exposureInput();
-const NO_SNAPSHOT_INPUT = (() => {
-  const input = entryInput();
-  delete input.exposures;
-  return input;
-})();
 const CAPS = caps();
 const OWNED_STATE = state();
 const UNOWNED_STATE = state(UNOWNED_STATE_INPUT);
 const FLAT_STATE = state({ ...STATE_INPUT, positions: [] });
 const APPLIED = applyReservation(OWNED_STATE, CAPS, BUY_REQUEST);
 const APPLIED_STATE = APPLIED.ok ? APPLIED.value.state : OWNED_STATE;
-const RECORD = approvedRecord();
 const COVERAGE = {
   strategyInstanceIds: [INSTANCE],
   marketIds: [MARKET_A, MARKET_B],
@@ -889,20 +842,6 @@ const SCENARIOS: readonly Scenario[] = [
     identicalOrFail: true,
   },
   {
-    name: "evaluateIntent — every exposure limit configured and measured",
-    doors: ["evaluateIntent"],
-    answer: () => evaluateIntent(EXPOSURE_POLICY, EXPOSURE_ENTRY_INPUT),
-    material: EXPOSURE_ENTRY_INPUT,
-    parses: true,
-  },
-  {
-    name: "evaluateIntent — an entry with NO exposure snapshot (fail closed)",
-    doors: ["evaluateIntent"],
-    answer: () => evaluateIntent(EXPOSURE_POLICY, NO_SNAPSHOT_INPUT),
-    material: NO_SNAPSHOT_INPUT,
-    parses: true,
-  },
-  {
     name: "validateEvaluationInput — the door",
     doors: ["validateEvaluationInput"],
     answer: () => validateEvaluationInput(ENTRY),
@@ -914,13 +853,6 @@ const SCENARIOS: readonly Scenario[] = [
     doors: ["parseRiskPolicy"],
     answer: () => parseRiskPolicy(POLICY_INPUT),
     material: POLICY_INPUT,
-    parses: true,
-  },
-  {
-    name: "resizeApprovedIntent",
-    doors: ["resizeApprovedIntent"],
-    answer: () => resizeApprovedIntent(RECORD as never, RESIZE_REQUEST),
-    material: { record: RECORD, request: RESIZE_REQUEST },
     parses: true,
   },
   {
@@ -1107,7 +1039,6 @@ describe("THE MECHANISM: an inherited property changes no public answer", { time
         "assessFreshness",
         "buildIntentView",
         "heldShares",
-        "checkExposureLimits",
         "recommendIncidentActions",
         "exposureSnapshot",
         "shadowExposureSnapshot",

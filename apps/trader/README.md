@@ -227,6 +227,41 @@ both the intent's tags and the emitting instance are still in hand, and the
 venue policy reads that book. An order whose value cannot be resolved is
 refused rather than submitted.
 
+## Configuration changes in `C1-RISK` (`COMPLEXITY-1`, 2026-10-08)
+
+Two fields were removed. The configuration doors are strict, so a document
+that still states one is **refused at startup with exit 78**. Edit every local
+or burn-in configuration before the next start.
+
+- **`riskPolicy.limits`'s six `*ExposureCap` fields.** The user ruled that the
+  capital allocator is the only exposure-cap authority. State each cap in
+  `allocatorCaps`:
+
+  | Retired field | Now |
+  | --- | --- |
+  | `globalExposureCap` | `allocatorCaps.globalAccountCap` |
+  | `perInstanceExposureCap` | `allocatorCaps.perStrategyCap` |
+  | `perMarketExposureCap` | `allocatorCaps.perMarketCap` |
+  | `perSeriesExposureCap` | `allocatorCaps.perSeriesCap` |
+  | `perUnderlyingExposureCap` | `allocatorCaps.perUnderlyingCap` |
+  | `perResolutionWindowExposureCap` | `allocatorCaps.perResolutionWindowCap` |
+
+  The refusal is `TRADER_RISK_POLICY_REFUSED`. Its first lines name the
+  `allocatorCaps` field for each retired cap. An entry over a cap is refused
+  `RISK_ALLOCATION_REFUSED`, with the allocator's `CAPITAL_*` code. The
+  allocator judges a multi-leg intent on the sum of its legs.
+- **`infrastructure.retentionMaxEvents`.** This process only consumes the
+  stream. The stream's retention is the data gateway's
+  (`GATEWAY_RETENTION_EVENTS`). The trader now connects with the event bus's
+  own ceiling, which trims nothing. The health section's
+  `transport.retentionMaxEvents` is always `null`, and the
+  `trader_transport_retention_max_events` metric and its dashboard series are
+  gone. The refusal is `TRADER_CONFIG_INVALID`.
+
+Not changed: `simulation.startingCash` and `accounting.startingCash` must still
+agree (`TRADER_CONFIG_INCONSISTENT`). Folding them into one field needs an edit
+outside this round's paths (`apps/backtest-cli`), and is recorded as a follow-up.
+
 ## A refused exit is counted, never compensated for
 
 This process does not re-tag intents, resize them, lower a policy bound, retry,
@@ -387,13 +422,12 @@ and none is claimed.
    configuration. Until then the operator asserts it and is accountable for it.
 2. **The `strategyInstanceId` conflict** (above) needs a contract-owner ruling.
 3. ~~**`packages/risk`'s exposure snapshot is not supplied.**~~ **DONE in
-   remediation round 1** and the entry was left stale; corrected in round 2.
-   `src/allocation.ts` builds the §9.8 check-15 snapshot with
-   `packages/capital-allocator`'s own `exposureSnapshotCovering`, and
-   `src/loop.ts` passes it unaltered. A configured exposure cap is now a real
-   comparison — `test/integration/paper-trader/capital-allocation.test.ts` drives
-   both directions, including a per-underlying cap that binds only because a
-   HELD position consumes it.
+   remediation round 1**, and **moot since `C1-RISK`** (2026-10-08): the
+   capital allocator is the only exposure-cap authority, so no snapshot is
+   handed to the risk engine. A configured cap is a real comparison —
+   `test/integration/paper-trader/capital-allocation.test.ts` drives both
+   directions through `allocatorCaps`, including a per-underlying cap that
+   binds only because a HELD position consumes it.
 4. **Independent SHADOW execution** (review round 2, HIGH-1). ADR-011 §1's
    "simulated execution, independent accounting" needs a second book: a separate
    cash balance, a separate ledger stream and a separate PnL surface, so a shadow

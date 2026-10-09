@@ -965,6 +965,7 @@ Pre-trade checks, cheapest first:
 13. Requested quantity respects participation limits.
 14. Balance, allowance, inventory, and reservations are sufficient.
 15. Per-order, per-market, per-instance, per-series, per-underlying, and global limits pass.
+    Note (2026-10-08, COMPLEXITY-1): per the user's ruling, the scope limits (per-market, per-instance, per-series, per-underlying, per-resolution-window and global) are enforced by the capital allocator (§9.7), the only exposure-cap authority, through check 14's verdict; it re-applies them at plan time before submission and judges a multi-leg intent on the sum of its legs. Check 15 itself enforces the per-order limit.
 16. Worst-case contractual loss passes.
 17. Scenario loss passes.
 18. Self-trade and duplicate-intent guards pass.

@@ -23,8 +23,8 @@
  *    the health surface (`health.ts`, `refusedExits`) and stands. A refused
  *    exit is visible; a wrong order is not acceptable.
  * 2. **It does not invent a value a package refused to default.** Where §9.8
- *    fails closed on an absent input — an absent `exposures` with a configured
- *    cap, an absent `allocation` verdict, an absent freshness measurement — this
+ *    fails closed on an absent input — an absent `allocation` verdict, an
+ *    absent freshness measurement — this
  *    module supplies the real measurement or supplies nothing. Filling a gap
  *    with a plausible number is how a fail-closed gate becomes a fail-open one.
  *
@@ -258,12 +258,6 @@ export interface RiskInputContext {
    */
   readonly unbookedFills: readonly UnbookedFillInput[];
   /**
-   * `packages/capital-allocator`'s §9.7 exposure snapshot, covering every scope
-   * this evaluation will query (`allocation.ts`). Absent is a real absence and
-   * §9.8 check 15 fails closed on it; the loop never supplies one.
-   */
-  readonly exposures: unknown;
-  /**
    * `packages/capital-allocator`'s own reservation verdict for this intent, or
    * `undefined` for an intent that commits nothing (a `CANCEL`).
    *
@@ -295,15 +289,17 @@ export interface RiskInputContext {
  *
  * Every absence below is a REAL absence, deliberately propagated: §9.8 fails
  * closed on an unknown, and manufacturing a value here would convert a
- * fail-closed check into a fail-open one. `secondsToClose`, `availableRequests`,
- * `exposures` and `allocation` are therefore omitted when the loop does not
+ * fail-closed check into a fail-open one. `secondsToClose`, `availableRequests`
+ * and `allocation` are therefore omitted when the loop does not
  * know them, rather than defaulted — and so are the `FEATURES` and
  * `REFERENCE_FEED` freshness measurements (`CO2-N1`: an unreadable process
  * clock leaves the features age unmeasured).
  *
- * For `exposures` and `allocation` the loop DOES know them: `allocation.ts`
- * asks `packages/capital-allocator` before every risk check, and this function
- * passes its answers through unaltered. The omission arms are still live and
+ * The loop DOES know `allocation`: `allocation.ts` asks
+ * `packages/capital-allocator` before every risk check, and this function
+ * passes its answer through unaltered. (Until C1-RISK it also passed the
+ * allocator's exposure snapshot for check 15's scope caps; the allocator is
+ * now the only exposure-cap authority, so its verdict carries them.) The omission arms are still live and
  * still correct — a `CANCEL` commits nothing, so it carries no verdict — and
  * they are what a reviewer should read as "the allocator was not asked".
  */
@@ -348,7 +344,6 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
       openOrders: context.openOrders,
     },
     unbookedFills: context.unbookedFills,
-    ...(context.exposures === undefined ? {} : { exposures: context.exposures }),
     ...(context.allocation === undefined ? {} : { allocation: context.allocation }),
     scenarios: context.scenarios,
     guards: { recentIntentIds: context.recentIntentIds },

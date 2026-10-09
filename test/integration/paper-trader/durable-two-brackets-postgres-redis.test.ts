@@ -194,7 +194,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { addDecimal } from "@polymarket-bot/decimal";
-import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
+import { MAX_RETENTION_EVENTS, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import {
@@ -493,7 +493,7 @@ async function runDurableTwoBrackets(options: RunOptions): Promise<DurableRun> {
     });
     const traderTransport = await RedisStreamsEventTransport.connect({
       connection: { url: redis.getConnectionUrl() },
-      retention: { maxEvents: parsed.config.infrastructure.retentionMaxEvents },
+      retention: { maxEvents: MAX_RETENTION_EVENTS },
     });
     const subscription = await traderTransport.subscribe({
       stream: parsed.config.infrastructure.eventStream,

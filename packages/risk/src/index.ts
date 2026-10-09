@@ -5,8 +5,8 @@
  * §9.8 lists them, with WORST-CASE CONTRACTUAL LOSS as the primary hard limit
  * (grounded in WP-110's venue-verified settlement payoffs; the unverified
  * `CANCELLED` outcome is floor-bounded, never valued — register row U-10).
- * Structured, package-owned reason codes on every rejection; approved-intent
- * records with resize-as-a-new-record lineage (§7.7); and typed incident action
+ * Structured, package-owned reason codes on every rejection; frozen
+ * approved-intent records (§7.7); and typed incident action
  * RECOMMENDATIONS for the §9.9 controller, which is a later package.
  *
  * Pure layer-1 logic (`docs/contracts/dependency-direction.md` §2): no I/O, no
@@ -51,8 +51,6 @@ export type {
 
 export {
   AllocationVerdictViewSchema,
-  ExposureEntryViewSchema,
-  ExposureSnapshotViewSchema,
   MarketContextSchema,
   PortfolioOpenOrderSchema,
   PortfolioPositionSchema,
@@ -64,8 +62,6 @@ export {
 } from "./inputs.js";
 export type {
   AllocationVerdictView,
-  ExposureEntryView,
-  ExposureSnapshotView,
   MarketContext,
   PortfolioOpenOrder,
   PortfolioPosition,
@@ -101,14 +97,9 @@ export type { ScenarioAssessment, ScenarioOutcome } from "./scenario.js";
 export { buildIntentView, heldShares } from "./intent-view.js";
 export type { IntentDisposition, IntentLeg, IntentView } from "./intent-view.js";
 
-export { checkExposureLimits } from "./exposure-limits.js";
-export type { ExposureProbe } from "./exposure-limits.js";
-
-export { ResizeRequestSchema, resizeApprovedIntent } from "./approved-intent.js";
 export type {
   ApprovedIntentLineage,
   ApprovedIntentRecord,
-  ResizeRequest,
   WorstCaseBasis,
 } from "./approved-intent.js";
 

@@ -78,17 +78,8 @@ export const RISK_REASON_CODES = [
   "RISK_SELL_EXCEEDS_INVENTORY",
   "RISK_QUOTE_MAX_INVENTORY_EXCEEDED",
 
-  // --- check 15: per-order / per-scope / global limits ----------------------
+  // --- check 15: per-order limit (the scope caps are the allocator's, check 14)
   "RISK_PER_ORDER_NOTIONAL_EXCEEDED",
-  "RISK_GLOBAL_EXPOSURE_EXCEEDED",
-  "RISK_INSTANCE_EXPOSURE_EXCEEDED",
-  "RISK_MARKET_EXPOSURE_EXCEEDED",
-  "RISK_SERIES_EXPOSURE_EXCEEDED",
-  "RISK_UNDERLYING_EXPOSURE_EXCEEDED",
-  "RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED",
-  "RISK_EXPOSURE_SNAPSHOT_MISSING",
-  "RISK_EXPOSURE_ENTRY_MISSING",
-  "RISK_SCOPE_KEY_MISSING",
 
   // --- check 16: worst-case contractual loss (PRIMARY) ----------------------
   "RISK_WORST_CASE_LOSS_EXCEEDED",
@@ -99,7 +90,6 @@ export const RISK_REASON_CODES = [
   // --- check 17: scenario loss ----------------------------------------------
   "RISK_SCENARIO_LOSS_EXCEEDED",
   "RISK_SCENARIO_MISSING",
-  "RISK_SCENARIO_MARKS_INCOMPLETE",
 
   // --- check 18: self-trade and duplicate-intent guards ---------------------
   "RISK_DUPLICATE_INTENT",
@@ -120,12 +110,6 @@ export const RISK_REASON_CODES = [
   "RISK_APPROVED",
   "RISK_CANCEL_ALWAYS_PERMITTED",
   "RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE",
-
-  // --- resize (creates a NEW approved-intent record; §7.7) ------------------
-  "RISK_RESIZE_NOT_A_REDUCTION",
-  "RISK_RESIZE_ID_REUSED",
-  "RISK_RESIZE_UNSUPPORTED_TYPE",
-  "RISK_RESIZE_INCOHERENT",
 ] as const;
 
 export type RiskReasonCode = (typeof RISK_REASON_CODES)[number];
@@ -136,11 +120,16 @@ export type RiskReasonCode = (typeof RISK_REASON_CODES)[number];
  * Pinned as a constant, and asserted against the list in
  * `test/unit/risk/engine.test.ts`, because the documented count drifted from
  * the real vocabulary once already (review round 1, MEDIUM: the handoff claimed
- * 56 against a 61-entry list). The count appears in `README.md` §5 and in
- * `docs/handoffs/WP-180.md`; changing the list without changing all three fails
- * the suite, which is the point.
+ * 56 against a 61-entry list). The count appears in `README.md` §5; changing the
+ * list without changing both fails the suite, which is the point.
+ *
+ * C1-RISK (2026-10-08) removed 14 codes that no longer have a producer: the
+ * nine check-15 exposure and scope codes (the capital allocator is the only
+ * exposure-cap authority), `RISK_SCENARIO_MARKS_INCOMPLETE` (an unmarked lot is
+ * valued at `0`), and the four `RISK_RESIZE_*` codes (the resize path had no
+ * caller). `docs/handoffs/WP-180.md` keeps the count of its own time.
  */
-export const RISK_REASON_CODE_COUNT = 62;
+export const RISK_REASON_CODE_COUNT = 48;
 
 const CODE_SET: ReadonlySet<string> = new Set(RISK_REASON_CODES);
 

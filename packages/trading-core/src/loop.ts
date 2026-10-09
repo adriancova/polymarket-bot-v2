@@ -2912,7 +2912,6 @@ export class CoreLoop {
       // this window's holdings first, then every other live window of the
       // same instance, each marked for check 17 (`#riskPortfolioFor`).
       ...this.#riskPortfolioFor(input.instance, input.market, positions, projection),
-      exposures: allocation.exposures,
       allocation: allocation.verdict,
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
       availableRequests: this.#availableRequests(input.epochMs),
@@ -5264,9 +5263,9 @@ export class CoreLoop {
    *   allocator's commitments under the INSTANCE id (`#unbookedFillsFor`);
    * - **scenario marks** — every one of those markets marked from its own
    *   YES book (`#scenariosFor`). A held window whose book has no bid has no
-   *   mark, and check 17 then refuses the entry
-   *   `RISK_SCENARIO_MARKS_INCOMPLETE`: a partially-marked portfolio is not a
-   *   measured one (fail closed).
+   *   mark, and check 17 values it at `0`: its whole committed cost counts as
+   *   loss, the floor check 16 uses (C1-RISK; ADR-030 Rule 8 item 2, note of
+   *   2026-10-08). Until then it refused the entry for the missing mark.
    *
    * Every other reader of the portfolio is PER MARKET (an exit's held shares,
    * §6 invariant 12's unknown-position test, a quote's inventory, check 18's
@@ -5306,7 +5305,7 @@ export class CoreLoop {
       // A live registration's market is always present (attach sets it
       // before registering; detach retires before deleting). Were it absent,
       // its holdings would still be counted and left unmarked: check 17
-      // refuses, never passes on a missing mark.
+      // values them at 0, their full committed cost (C1-RISK).
       const state = this.#options.markets.get(other.marketId);
       if (state !== undefined) marked.push(state);
     }
@@ -5488,8 +5487,8 @@ export class CoreLoop {
    * The mark is the YES book's best BID — what the position could actually be
    * sold into — chosen because it needs no division and therefore no rounding
    * policy inside a risk input. A market whose bid side is empty produces NO
-   * mark, so the scenario is incomplete and `assessScenarios` refuses the
-   * entry: an unmeasurable scenario is not a passed one.
+   * mark, and `assessScenarios` values its lot at `0` (C1-RISK): the full
+   * committed cost counts as loss, so a missing mark never understates it.
    *
    * `ROLLOVER-1` r7 (R7-FABLE-01): one mark per market of the portfolio
    * (`#riskPortfolioFor`: the evaluating market first, then the instance's

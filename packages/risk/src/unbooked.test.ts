@@ -288,9 +288,20 @@ describe("CAP-1 r0: MONOTONE — an unbooked fill may raise a check-16 or check-
     expect(pending.refusals.at(0)?.details).toMatchObject({ worstLoss: "1.25" });
   });
 
-  it("an unbooked fill in a market no scenario marks is refused RISK_SCENARIO_MARKS_INCOMPLETE (check 17, fail closed) — and a scenario loss the booked-only lot set exceeds is still refused as such", () => {
+  it("C1-RISK: an unbooked fill in a market no scenario marks is valued at 0 — its whole debit counts as scenario loss — and that loss is compared and refused like any other", () => {
+    // Measured: MARKET (3.5 − 10 × 0.4 = −0.5) plus the unmarked OTHER_MARKET
+    // fill at its full debit 3.4 = 2.9. Admitted under the default limit.
     const pending = evaluateIntent(policy(), entryInput({ unbookedFills: [unbooked("10", "3.4", "YES", OTHER_MARKET)] }));
-    expect(codesOf(pending)).toEqual(["RISK_SCENARIO_MARKS_INCOMPLETE"]);
+    expect(codesOf(pending)).toEqual([]);
+    expect(pending.scenario?.worstLoss).toBe("2.9");
+    // At the limit it passes; one cent under, it is refused with that figure.
+    expect(codesOf(evaluateIntent(policy({ scenario: "2.9" }), entryInput({ unbookedFills: [unbooked("10", "3.4", "YES", OTHER_MARKET)] })))).toEqual([]);
+    const tight = evaluateIntent(policy({ scenario: "2.89" }), entryInput({ unbookedFills: [unbooked("10", "3.4", "YES", OTHER_MARKET)] }));
+    expect(codesOf(tight)).toEqual(["RISK_SCENARIO_LOSS_EXCEEDED"]);
+    expect(tight.refusals.at(0)?.details).toMatchObject({ worstLoss: "2.9" });
+
+    // With a booked position too: (4 + 1.75 + 3.4) − 15 × 0.3 = 4.65, above
+    // the booked-only 1.25, so 4.65 is the compared figure.
     const both = evaluateIntent(
       policy({ scenario: "1" }),
       entryInput({
@@ -300,8 +311,8 @@ describe("CAP-1 r0: MONOTONE — an unbooked fill may raise a check-16 or check-
         unbookedFills: [unbooked("10", "3.4", "YES", OTHER_MARKET)],
       }),
     );
-    expect(codesOf(both)).toEqual(["RISK_SCENARIO_MARKS_INCOMPLETE", "RISK_SCENARIO_LOSS_EXCEEDED"]);
-    expect(both.refusals.at(1)?.details).toMatchObject({ worstLoss: "1.25" });
+    expect(codesOf(both)).toEqual(["RISK_SCENARIO_LOSS_EXCEEDED"]);
+    expect(both.refusals.at(0)?.details).toMatchObject({ worstLoss: "4.65" });
   });
 });
 
@@ -334,7 +345,6 @@ const CHECKS_16_AND_17 = new Set([
   "RISK_WORST_CASE_LOSS_EXCEEDED",
   "RISK_WORST_CASE_RESOLUTION_LOSS_EXCEEDED",
   "RISK_SCENARIO_LOSS_EXCEEDED",
-  "RISK_SCENARIO_MARKS_INCOMPLETE",
   "RISK_SCENARIO_MISSING",
 ]);
 
@@ -367,7 +377,7 @@ function randomState(random: () => number): {
     const shares = pick(random, SIZES);
     fills.push(unbooked(shares, mulDecimal(shares, pick(random, PRICES)), pick(random, SIDES), pick(random, markets)));
   }
-  // Marks: usually every market; sometimes the first market only (an incomplete scenario).
+  // Marks: usually every market; sometimes the first market only (the other is valued at 0).
   const marked = random() < 0.85 ? markets : [MARKET];
   const scenarioList = KINDS.map((kind) => ({
     scenarioId: `scen-${kind.toLowerCase()}`,
@@ -449,10 +459,10 @@ describe("CAP-1 r0 property — for the same state, the candidate's check-16 and
           expect(compareDecimal(compared.worstLoss ?? "0", scenarioBase.worstLoss), where).toBeGreaterThanOrEqual(0);
           if (compareDecimal(compared.worstLoss ?? "0", scenarioBase.worstLoss) > 0) strictlyRaised += 1;
         }
-        // A lot set the candidate cannot mark refuses (MARKS_INCOMPLETE).
-        if (scenarioCandidate.worstLoss === undefined && scenarioBase.worstLoss !== undefined) {
-          expect(scenarioCandidate.incompleteScenarioIds.length, where).toBeGreaterThan(0);
-        }
+        // C1-RISK: an unmarked lot is valued at 0, so every supplied scenario
+        // yields a loss for both lot sets.
+        expect(scenarioCandidate.worstLoss, where).toBeDefined();
+        expect(scenarioBase.worstLoss, where).toBeDefined();
         if (fills.length === 0) {
           expect(candidate, where).toEqual(base);
           expect(scenarioCandidate, where).toEqual(scenarioBase);

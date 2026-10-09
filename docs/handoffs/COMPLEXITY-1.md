@@ -39,7 +39,7 @@
 | C1-V29 | V2-9's scanner cut from about 6,150 to about 1,540 production lines; no fixture byte changed | astra ACCEPT, round 1 (`726bc19`) | V2-9, `636536a` (PR #90) |
 | C1-PROC | The brief from 82 KB to 18 KB, with RESIDUALS.md (127 rows, moved verbatim and proven); check-brief from 41 rules to 7; the preservation tools deleted (`tools/records` from 3,281 to 447 lines); status in the PR; the runbook's current loop; the ADR budget; the lighter reading list | astra ACCEPT, round 1; LOWs R1-01 and R1-02 fixed (`80fc9bb`) | via PR #91 |
 | C1-HALTS | Honest halts (`ACTION_FOR`, `release()` and `OPERATOR_HALT` deleted; every halt ends the run); a book divergence clears its baseline and waits for the next snapshot (benign drops counted, faults still halt); the ADR-023 taint narrowed (note appended); data-quality incidents close at the trader; infrastructure halt pages resolve on the next run; `register --new-run` | dual (Opus + astra) ACCEPT on substance in round 1 (`919ec24`); the round-1 LOWs fixed (`084bd46`); the round cap was reached only on SCOPE-1, a forced 2-literal test edit that the orchestrator ratified | via PR #93 |
-| C1-RISK | The allocator as the only exposure authority; check 17; the dead resize path and knobs | dual, queued | — |
+| C1-RISK | The capital allocator is the only exposure-cap authority (it sums multi-leg intents; check 15 keeps only maxOrderNotional; 9 codes and 6 settings removed; old configs refused naming allocatorCaps); check 17 values an unmarked lot at 0 (RISK_SCENARIO_MARKS_INCOMPLETE removed; domination pin); the resize path removed (4 codes); the trader's retentionMaxEvents knob and metric removed. Reason codes 62 to 48; +1,079/-2,333 lines | dual ACCEPT in round 2 (`b16fc50`; round 1: a MEDIUM test-timeout risk and 3 LOWs, all fixed) | via PR #94 |
 | C1-TIF | The ADR-034 re-sequence | queued | — |
 | C1-UNIV | Import universe's series code | queued | — |
 | C1-OPS | The control API answers an audited 501 CONTROL_NOT_WIRED in PAPER; one PAPER compose stack (`infra/compose/paper`, its own project and ports); RecorderRtdsHalted deleted and the recorder fragments marked not deployable; `docs/runbooks/paper-operations.md`; the series messages corrected; the brief check and self-test in CI | astra ACCEPT on the second attempt (`a645c6d`) after the orchestrator widened a too-narrow grant and reverted a scope retreat; LOW R1-01 fixed (`b1db4f8`) | via PR #92 |
@@ -66,3 +66,11 @@
   - L6: the stale "until an operator resolves its row" text in the Grafana operations dashboard.
   - OPS-03 (b): key the consumer by run id.
 - `FOLD-RELATCH` is moot (RESIDUALS.md).
+
+## C1-RISK notes
+- **Deferred:** removing `simulation.startingCash` (OPS-07). It needs `apps/backtest-cli/src/assembly.ts`, and the duplicate costs little.
+- **Vacuous now:** WP-180's criterion "risk resize creates a new approved-intent record". No resize path exists, and the planner refuses instead.
+- **Operators:** a burn-in config that still carries a retired `*ExposureCap` field is refused at startup (exit 78), naming its `allocatorCaps` replacement.
+- **Follow-ups:**
+  - The allocator's cap checks on sell legs can refuse an exit when a scope is already over its cap, for example after a cap is lowered while a position is open.
+  - Static Bracket has no lower entry bound; a minimum trigger price or bid depth belongs in the strategy.
