@@ -114,6 +114,10 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     round 5 fails closed on what the scanner cannot decode, parse or read
     (malformed percent-encoding, an unknown query parameter, a non-JSON
     frame text other than a control message), naming the reason;
+    round 6 binds each non-feed sidecar URL to its report source-index URL
+    (or the text before the index's `…`), types its query values, and
+    refuses a trade cursor anywhere outside the trade pages unless it is a
+    public market cursor classified for its route (`prices_history`);
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no

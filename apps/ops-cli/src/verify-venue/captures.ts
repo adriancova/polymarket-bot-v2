@@ -83,6 +83,15 @@
  *    holds neither an address string nor `null`; a `.jsonl` data text that
  *    is neither JSON nor a known control message; and a sidecar that is not
  *    UTF-8.
+ * 9. **Outside the feeds, and in fixture envelopes** (round 6): a capture
+ *    that is not a trade or activity page keeps the URL its report's source
+ *    index records (or extends the text before the index's `…`), each query
+ *    value has its listed type (`nonFeedUrlErrors`), and no sidecar text or
+ *    capture string hides a venue cursor that is not a public market cursor
+ *    classified for its route (`PUBLIC_MARKET_CURSORS`,
+ *    `venueCursorAnchorErrors`; V2-9-R6-02). Every WP-000 fixture envelope
+ *    answers to the personal-data, cursor and long-id scan
+ *    (`fixturePersonalDataErrors`, wired by `index.ts`; V2-9-R6-01).
  *
  * Offline: local files only. No network, no credential, no order.
  */
@@ -90,7 +99,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 
-import type { FieldSpec } from "./fixtures.js";
+import type { FieldSpec, FixtureFile } from "./fixtures.js";
 import {
   VENUE_FIXTURE_ROOT,
   isRecord,
@@ -337,6 +346,102 @@ export const SIDECAR_QUERY_PARAMETERS: readonly {
     parameters: ["series_id", "closed", "limit"],
   },
 ];
+
+/**
+ * The value type of each parameter `SIDECAR_QUERY_PARAMETERS` lists (round
+ * 6, V2-9-R6-02), so that no value of another shape, a transaction hash for
+ * example, rides on a known parameter of a capture that is not a feed. These
+ * are the shapes the gate admits, taken from the committed values and the
+ * report's source-index URLs; they claim no venue rule. Fail closed: a
+ * value of another shape is refused until its package widens the type, with
+ * its source. A market id must also be one the report read
+ * (`nonFeedUrlErrors`).
+ */
+export const SIDECAR_PARAMETER_TYPES: Readonly<
+  Record<string, { readonly accepts: (value: string, route: string) => boolean; readonly description: string }>
+> = {
+  token_id: { accepts: (value) => TOKEN_ID_RE.test(value), description: "a decimal token id" },
+  condition: {
+    accepts: (value) => CONDITION_ID_RE.test(value),
+    description: "a condition id (0x and 62 or 64 lowercase hex digits)",
+  },
+  interval: {
+    accepts: (value) => /^[1-9][0-9]{0,2}[mhdw]$/.test(value),
+    description: "a short duration (1 to 3 digits and m, h, d or w)",
+  },
+  bucket_seconds: { accepts: (value) => /^[1-9][0-9]{0,6}$/.test(value), description: "a positive integer of at most 7 digits" },
+  limit: { accepts: (value) => /^(?:0|[1-9][0-9]{0,3})$/.test(value), description: "an integer of at most 4 digits" },
+  series_id: { accepts: (value) => /^[1-9][0-9]{0,18}$/.test(value), description: "a decimal series id of at most 19 digits" },
+  closed: { accepts: (value) => value === "true" || value === "false", description: "true or false" },
+  cursor: {
+    accepts: (value, route) => {
+      const type = venueCursorType(decodeFeedCursor(value));
+      return type !== undefined && isClassifiedMarketCursor(type, route);
+    },
+    description: "a public market cursor classified for the route (PUBLIC_MARKET_CURSORS)",
+  },
+};
+
+/**
+ * The URL refusals of a capture that is not a trade or activity page (round
+ * 6, V2-9-R6-02). The report, not the sidecar, vouches for the URL's
+ * identifiers:
+ *
+ * - the sidecar URL is the URL the report's source index records for the
+ *   catalogue source id, character for character; or, when the index cuts
+ *   that URL with `…`, it extends the text before the `…`;
+ * - each query value of an `https` URL has the type its parameter is listed
+ *   with (`SIDECAR_PARAMETER_TYPES`), and, but for a classified market
+ *   cursor, carries no hash-shaped run that is not a market id the report
+ *   read (`unexplainedHashRuns`).
+ *
+ * So a transaction hash, a wallet or a feed cursor cannot replace a token id,
+ * a condition or a path id, nor ride on the part of the URL the report cuts.
+ */
+export function nonFeedUrlErrors(
+  url: string,
+  row: SourceIndexRow | undefined,
+  ids: FeedMarketIds = NO_MARKET_IDS,
+): string[] {
+  const errors: string[] = [];
+  if (row !== undefined) {
+    const cut = row.url.indexOf("…");
+    const bound = cut === -1 ? url === row.url : url.startsWith(row.url.slice(0, cut));
+    if (!bound) {
+      errors.push(
+        `sidecar.url: must be ${row.id}'s URL in the report's source index${cut === -1 ? "" : " (or extend the text before its …)"}, so that the report vouches for every identifier in it (round 6)`,
+      );
+    }
+  }
+  if (!url.startsWith("https://")) {
+    return errors;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // `captureUrlErrors` names the failure.
+    return errors;
+  }
+  const route = urlRouteOf(url);
+  for (const [key, value] of parsed.searchParams) {
+    const type = Object.hasOwn(SIDECAR_PARAMETER_TYPES, key) ? SIDECAR_PARAMETER_TYPES[key] : undefined;
+    if (type === undefined) {
+      // `queryParameterErrors` refuses an unknown parameter.
+      continue;
+    }
+    if (!type.accepts(value, route)) {
+      errors.push(
+        `sidecar url ${key}: the value is not ${type.description}, so the gate cannot judge it and fails closed (round 6)`,
+      );
+    } else if (key !== "cursor" && unexplainedHashRuns(value, ids).length > 0) {
+      errors.push(
+        `sidecar url ${key}: the value carries a hash-shaped run that is not a market id the report read (round 6)`,
+      );
+    }
+  }
+  return errors;
+}
 
 /** Round 5: each query parameter of an `https` URL is one its route lists. */
 function queryParameterErrors(parsed: URL): string[] {
@@ -978,9 +1083,15 @@ function isProsePlaceholder(token: string): boolean {
   );
 }
 
-function personalAssignmentErrors(text: string, where: string): string[] {
+function personalAssignmentErrors(text: string, where: string, hashKeys = true): string[] {
   const errors: string[] = [];
   for (const match of text.normalize("NFKC").matchAll(PERSONAL_ASSIGNMENT_RE)) {
+    if (!hashKeys && /hash$/i.test(match[1] ?? "")) {
+      // A fixture envelope judges a hash by its value (the long-id rule of
+      // `fixturePersonalDataErrors`), not by its label: the frozen V1 CTF
+      // notes type `outcome.transactionHash: TxHash`.
+      continue;
+    }
     if (!isProsePlaceholder(match[2] ?? "")) {
       errors.push(
         `${where}: ${(match[1] ?? "").toLowerCase()} is written with a value that is not a labelled synthetic value, a <placeholder> or empty`,
@@ -1115,6 +1226,17 @@ function errorsOfReadings(
  * not hide it. `{}` is not counted, so random decoded bytes do not match.
  */
 function embedsJsonObject(text: string): boolean {
+  return embeddedJsonObjects(text, true).length > 0;
+}
+
+/**
+ * The non-empty JSON objects a text embeds (see `embedsJsonObject`): every
+ * span `JSON.parse` reads as an object with a key. With `first`, only the
+ * first one found. Round 6: the venue-cursor scan classifies each one
+ * (`venueCursorAnchorErrors`).
+ */
+function embeddedJsonObjects(text: string, first = false): Record<string, unknown>[] {
+  const found: Record<string, unknown>[] = [];
   const opens: number[] = [];
   const closes: number[] = [];
   for (let index = 0; index < text.length; index += 1) {
@@ -1132,14 +1254,17 @@ function embedsJsonObject(text: string): boolean {
       try {
         const value: unknown = JSON.parse(text.slice(open, close + 1));
         if (isRecord(value) && Object.keys(value).length > 0) {
-          return true;
+          found.push(value);
+          if (first) {
+            return found;
+          }
         }
       } catch {
         // not one JSON object at this span
       }
     }
   }
-  return false;
+  return found;
 }
 
 /** A run of base64 or base64url characters; `=` (padding, assignment) ends it. */
@@ -1156,22 +1281,35 @@ const HEX_RUN_RE = /[0-9a-fA-F]{32,}/g;
  * anywhere in the decoded text (so a glued suffix cannot hide it either).
  */
 function runHidesJsonObject(run: string): boolean {
-  if (decodeFeedCursor(run) !== undefined) {
-    return true;
-  }
-  for (let offset = 0; offset < 4; offset += 1) {
-    if (embedsJsonObject(Buffer.from(run.slice(offset), "base64").toString("utf8"))) {
-      return true;
+  return runJsonObjects(run, true).length > 0;
+}
+
+/**
+ * The JSON objects one run of encoded characters hides (see
+ * `runHidesJsonObject`); with `first`, only the first one found (round 6).
+ */
+function runJsonObjects(run: string, first = false): unknown[] {
+  const found: unknown[] = [];
+  const whole = decodeFeedCursor(run);
+  if (whole !== undefined) {
+    found.push(whole);
+    if (first) {
+      return found;
     }
   }
-  for (const [hexRun] of run.matchAll(HEX_RUN_RE)) {
-    for (let offset = 0; offset < 2; offset += 1) {
-      if (embedsJsonObject(Buffer.from(hexRun.slice(offset), "hex").toString("utf8"))) {
-        return true;
-      }
+  const decodings = [
+    ...[0, 1, 2, 3].map((offset) => Buffer.from(run.slice(offset), "base64").toString("utf8")),
+    ...[...run.matchAll(HEX_RUN_RE)].flatMap(([hexRun]) =>
+      [0, 1].map((offset) => Buffer.from(hexRun.slice(offset), "hex").toString("utf8")),
+    ),
+  ];
+  for (const decoded of decodings) {
+    found.push(...embeddedJsonObjects(decoded, first));
+    if (first && found.length > 0) {
+      return found;
     }
   }
-  return false;
+  return found;
 }
 
 /**
@@ -1235,6 +1373,110 @@ function cursorScanErrors(text: string, where: string, message: string): string[
   return [
     ...(scan.failure === undefined ? [] : [undecodableError(`${where} (cursor scan)`, scan.failure)]),
     ...(scan.tokens.length > 0 ? [message] : []),
+  ];
+}
+
+// --- venue cursors outside the feeds (round 6) --------------------------------
+//
+// V2-9-R6-02: a trade or activity cursor pasted into the provenance of a
+// capture that is not a feed (a sidecar's notes, URL, redactions or extract
+// rule), into such a capture's strings, or into a fixture envelope, carries
+// the seek anchor of a feed's last row (S-O06) just the same. The feed rules
+// (rule 6) refuse every cursor-like token; outside the feeds a public market
+// cursor is legitimate (the `prices_history` cursor of S-A03), so there the
+// scan refuses each token that decodes to a venue cursor unless its type is
+// one `PUBLIC_MARKET_CURSORS` classifies for the capture's route.
+
+/**
+ * The public market cursors the gate admits outside the trade and activity
+ * feeds, by type and route. Source: the committed VENUE-4 captures
+ * `protocol-v2/data-v2-prices-history-page{1,2}` (S-A02, S-A03): the page's
+ * `next_cursor` and the page-2 URL's `cursor` decode to
+ * `{"data":{"type":"prices_history","params":{…}},"sig":…}`, a public price
+ * series of a market, not of an account. Fail closed: another type, or this
+ * type on another route, is refused until the package that captures it
+ * classifies it here, with its source.
+ */
+export const PUBLIC_MARKET_CURSORS: readonly {
+  readonly type: string;
+  readonly route: string;
+}[] = [{ type: "prices_history", route: "https://data-api.polymarket.com/v2/prices-history" }];
+
+/**
+ * Whether a decoded object has the shape of a venue cursor (S-O06; the
+ * committed cursors): a `sig`, or a `data` object with a `type` or `params`.
+ * Returns its `data.type` (`""` when it has none), or `undefined` when the
+ * object is not cursor-shaped.
+ */
+function venueCursorType(value: unknown): string | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const data = value["data"];
+  const shaped =
+    Object.hasOwn(value, "sig") ||
+    (isRecord(data) && (Object.hasOwn(data, "type") || Object.hasOwn(data, "params")));
+  if (!shaped) {
+    return undefined;
+  }
+  const type = isRecord(data) ? data["type"] : undefined;
+  return typeof type === "string" ? type : "";
+}
+
+/**
+ * Whether a venue-cursor type is a public market cursor classified for a
+ * route (`PUBLIC_MARKET_CURSORS`). `route`: `urlRouteOf` of the URL; `""`
+ * for a text with no route (a fixture envelope), where none is classified.
+ */
+function isClassifiedMarketCursor(type: string, route: string): boolean {
+  return PUBLIC_MARKET_CURSORS.some((entry) => entry.type === type && entry.route === route);
+}
+
+/**
+ * The venue-cursor types one text hides that are not classified for
+ * `route` (round 6), in every reading (`textReadings`): JSON written as text,
+ * and every base64, base64url or hex run, decoded through a glued prefix or
+ * suffix, as `cursorLikeTokens` reads them. Also why the text cannot be
+ * decoded, if so (fail closed).
+ */
+export function unclassifiedVenueCursors(
+  text: string,
+  route: string,
+): { readonly types: readonly string[]; readonly failure?: string } {
+  const { readings, failure } = textReadings(text);
+  const types = new Set<string>();
+  for (const reading of readings) {
+    const objects: unknown[] = [];
+    if (reading.includes("{")) {
+      objects.push(...embeddedJsonObjects(reading));
+    }
+    for (const [run] of reading.matchAll(BASE64_RUN_RE)) {
+      objects.push(...runJsonObjects(run));
+    }
+    for (const object of objects) {
+      const type = venueCursorType(object);
+      if (type !== undefined && !isClassifiedMarketCursor(type, route)) {
+        types.add(type);
+      }
+    }
+  }
+  return failure === undefined ? { types: [...types] } : { types: [...types], failure };
+}
+
+/**
+ * The refusals of one text outside the feeds (round 6, V2-9-R6-02): a token
+ * that decodes to a venue cursor not classified for `route`, and the named
+ * failure when the text cannot be decoded.
+ */
+export function venueCursorAnchorErrors(text: string, where: string, route: string): string[] {
+  const scan = unclassifiedVenueCursors(text, route);
+  return [
+    ...(scan.failure === undefined ? [] : [undecodableError(`${where} (cursor scan)`, scan.failure)]),
+    ...(scan.types.length === 0
+      ? []
+      : [
+          `${where}: a token decodes to a venue cursor (type ${scan.types.map((type) => JSON.stringify(type)).join(", ")}), which carries the seek anchor of a feed's last row (S-O06); outside the trade and activity feeds only a public market cursor classified for the route (PUBLIC_MARKET_CURSORS) may be committed`,
+        ]),
   ];
 }
 
@@ -1316,8 +1558,26 @@ export function sidecarPersonalDataErrors(
         `${where}: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value`,
       );
     }
+    if (!feed) {
+      // Round 6 (V2-9-R6-02): outside the feeds too, a venue cursor that is
+      // not a classified public market cursor is refused.
+      errors.push(...unclassifiedCursorErrors(text, where, urlRouteOf(sidecar.url)));
+    }
+  }
+  if (!feed) {
+    errors.push(...unclassifiedCursorErrors(sidecar.url, "sidecar.url", urlRouteOf(sidecar.url)));
   }
   return errors;
+}
+
+/**
+ * `venueCursorAnchorErrors` without the decode failure, for a text whose
+ * failure the caller has already named once.
+ */
+function unclassifiedCursorErrors(text: string, where: string, route: string): string[] {
+  return venueCursorAnchorErrors(text, where, route).filter(
+    (error) => !error.startsWith(`${where} (cursor scan)`),
+  );
 }
 
 const FEED_ROUTE_RE =
@@ -1809,6 +2069,147 @@ export function feedUrlErrors(url: string, ids: FeedMarketIds = NO_MARKET_IDS): 
     ),
   );
   return errors;
+}
+
+// --- fixture envelopes (round 6) ----------------------------------------------
+
+/**
+ * V2-9-R6-01: the personal-data, cursor and long-id scan of a WP-000 fixture
+ * envelope (`{fixture, source, retrieved, sanitized, notes, examples}`), the
+ * rules captures and sidecars answer to (rule 5, and the round-6 cursor
+ * scan), applied to every fixture-kind check by `index.ts`:
+ *
+ * - every envelope text (`fixture`, `source`, `retrieved`, `notes`, each
+ *   example `name`) and every payload string and key, in every reading
+ *   (`textReadings`; a text the scanner cannot decode fails by name): no
+ *   email address, and no `0x` 40-hex address other than a labelled
+ *   synthetic one or a documented public contract address;
+ * - every payload: the personal keys (`scanPersonalData`), so a wallet,
+ *   pseudonym, profile, email or user name holds a labelled synthetic value;
+ * - the notes and every payload text: no personal field written with a
+ *   value (`name: …`), and no token that decodes to a venue cursor (none is
+ *   classified outside a capture's route);
+ * - a value under a transaction-hash key (`transaction_hash`,
+ *   `transactionHash`, `tx_hash`, `transactionsHashes`), at any depth: a
+ *   labelled synthetic hash or empty;
+ * - the notes, and every payload string with a space (prose): no hex id,
+ *   hash or number of 40 or more digits that is not labelled synthetic,
+ *   unless a payload carries it as a whole value (an id its payload spec and
+ *   `assert` hook judge) or the check's report (`vouchingText`) records it.
+ *
+ * So a wallet, an email, a feed cursor or a transaction hash pasted into a
+ * fixture's notes or payload prose fails the gate, as it does in a sidecar.
+ */
+export function fixturePersonalDataErrors(
+  fixture: FixtureFile,
+  publicAddresses: readonly string[],
+  vouchingText: string,
+): string[] {
+  const errors: string[] = [];
+  // The documented contract addresses, and those the check's report records
+  // (the 2026-08-24 report records the V1 CTF contracts).
+  const addresses = new Set([
+    ...publicAddresses.map((address) => address.toLowerCase()),
+    ...[...vouchingText.matchAll(ADDRESS_TOKEN_RE)].map(([address]) => address.toLowerCase()),
+  ]);
+  const policy: PersonalDataPolicy = { publicAddresses: addresses, feedRows: new Set(), dataApi: false };
+  const payloadStrings = fixture.examples.flatMap((example) =>
+    stringsWithPaths(example.payload, `examples ${example.name} payload`),
+  );
+  const wholeValues = new Set(
+    payloadStrings.map(([, text]) => text).filter((text) => !/\s/.test(text)).map((text) => text.toLowerCase()),
+  );
+  const vouching = vouchingText.toLowerCase();
+  const prose = (text: string): boolean => /\s/.test(text);
+  const hasUnexplainedLongId = (readings: readonly string[]): boolean =>
+    readings.some((reading) =>
+      [...reading.matchAll(LONG_ID_TOKEN_RE)].some(([token]) => {
+        const lower = token.toLowerCase();
+        return (
+          !isLabelledSyntheticHex(token, token.length - 2) &&
+          !wholeValues.has(lower) &&
+          !vouching.includes(lower)
+        );
+      }),
+    );
+  const scanText = (where: string, text: string, isProse: boolean): void => {
+    const { readings, failure } = textReadings(text);
+    if (failure !== undefined) {
+      errors.push(undecodableError(where, failure));
+    }
+    errors.push(
+      ...errorsOfReadings(readings, (reading) => [
+        ...personalValueErrors(reading, where, addresses),
+        ...personalAssignmentErrors(reading, where, false),
+      ]),
+    );
+    if (isProse && hasUnexplainedLongId(readings)) {
+      errors.push(
+        `${where}: a hex id, hash or number of 40 or more digits that is not a labelled synthetic value, that no payload carries as a value and that the report does not record; name it by placeholder`,
+      );
+    }
+    errors.push(...unclassifiedCursorErrors(text, where, ""));
+  };
+  scanText("fixture", fixture.fixture, false);
+  scanText("source", fixture.source, false);
+  scanText("retrieved", fixture.retrieved, false);
+  scanText("notes", fixture.notes, true);
+  for (const example of fixture.examples) {
+    scanText(`examples ${example.name} name`, example.name, false);
+    // The personal keys, and the decoded personal values of every string.
+    scanPersonalData(example.payload, `examples ${example.name} payload`, errors, policy);
+  }
+  // A transaction hash names its sender on chain: under a transaction-hash
+  // key, at any depth of any payload (not only a person's row), a value is a
+  // labelled synthetic hash or empty. Every committed one is (0x00…0501).
+  const hashKeyErrors = (value: unknown, path: string): void => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => hashKeyErrors(entry, `${path}[${index}]`));
+    } else if (isRecord(value)) {
+      for (const [key, entry] of Object.entries(value)) {
+        const where = `${path}.${key}`;
+        if (/^(?:transactions?|tx)hash(?:es)?$/.test(normalizedKey(key))) {
+          const values = Array.isArray(entry) ? entry : [entry];
+          if (values.some((item) => item !== "" && item !== null && !isLabelledSyntheticHex(item, 64))) {
+            errors.push(`${where}: a transaction hash must be a labelled synthetic hash (0x00…) or empty`);
+          }
+          continue;
+        }
+        hashKeyErrors(entry, where);
+      }
+    }
+  };
+  for (const example of fixture.examples) {
+    hashKeyErrors(example.payload, `examples ${example.name} payload`);
+  }
+  for (const [where, text] of payloadStrings) {
+    // Personal values are judged by `scanPersonalData` above.
+    errors.push(
+      ...errorsOfReadings(textReadings(text).readings, (reading) => personalAssignmentErrors(reading, where, false)),
+    );
+    if (prose(text) && hasUnexplainedLongId(textReadings(text).readings)) {
+      errors.push(
+        `${where}: a hex id, hash or number of 40 or more digits in prose that is not a labelled synthetic value, that no payload carries as a value and that the report does not record; name it by placeholder`,
+      );
+    }
+    errors.push(...unclassifiedCursorErrors(text, where, ""));
+  }
+  return errors;
+}
+
+/** Every string of a parsed JSON value (keys included), with its path (round 6). */
+function stringsWithPaths(value: unknown, path: string, into: [string, string][] = []): [string, string][] {
+  if (typeof value === "string") {
+    into.push([path, value]);
+  } else if (Array.isArray(value)) {
+    value.forEach((entry, index) => stringsWithPaths(entry, `${path}[${index}]`, into));
+  } else if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      into.push([`${path} key`, key]);
+      stringsWithPaths(entry, `${path}.${key}`, into);
+    }
+  }
+  return into;
 }
 
 /** Every string of a parsed JSON value (keys included). */
@@ -2469,6 +2870,15 @@ export function validateCapture(
     errors.push(
       ...feedErrors(view, sidecar, marketIds, new TextDecoder("utf-8").decode(fixtureBytes)),
     );
+  } else {
+    // Round 6 (V2-9-R6-02): outside the feeds, the report vouches for the
+    // URL's identifiers, and no capture string hides a venue cursor that is
+    // not a classified public market cursor.
+    errors.push(...nonFeedUrlErrors(sidecar.url, reportRow, marketIds));
+    // A string that cannot be decoded is named once, by the personal scan.
+    for (const [where, text] of stringsWithPaths(personalScanTarget(view, spec.format), "$")) {
+      errors.push(...unclassifiedCursorErrors(text, where, urlRouteOf(sidecar.url)));
+    }
   }
 
   // 7. The pins, and the ids they cite.

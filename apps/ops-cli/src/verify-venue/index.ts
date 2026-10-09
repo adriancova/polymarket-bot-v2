@@ -41,6 +41,7 @@ import { join, relative, sep } from "node:path";
 
 import {
   catalogueTokenIds,
+  fixturePersonalDataErrors,
   loadCapture,
   marketReadConditionIds,
   marketReadTokenIds,
@@ -474,6 +475,34 @@ export function captureContextOf(
   };
 }
 
+/**
+ * The refusals of one fixture file of a fixture-kind check, each prefixed by
+ * its path: the envelope and payload validation (`loadFixture`), the
+ * snapshot date, the check's `assert` hook, and (V2-9 round 6,
+ * V2-9-R6-01) the personal-data, cursor and long-id scan that captures and
+ * sidecars answer to (`fixturePersonalDataErrors`), on every fixture
+ * envelope, with the check's report vouching for the long ids and contract
+ * addresses it records.
+ */
+export function fixtureCheckErrors(
+  check: VenueCheck,
+  result: FixtureValidationResult,
+  checkReport: string | null,
+): string[] {
+  const fixture = result.fixture;
+  const extra =
+    fixture === null
+      ? []
+      : [
+          ...(fixture.retrieved === snapshotDateOf(check)
+            ? []
+            : [`retrieved must be ${snapshotDateOf(check)}, the snapshot date of ${reportOf(check)}`]),
+          ...(check.assert?.(fixture) ?? []),
+          ...fixturePersonalDataErrors(fixture, PUBLIC_CONTRACT_ADDRESSES, checkReport ?? ""),
+        ];
+  return [...result.errors, ...extra].map((error) => `${result.relativePath}: ${error}`);
+}
+
 /** Runs every check against local fixtures and the dated reports only. */
 export function runVenueVerification(): VenueVerificationReport {
   const { content, validation } = loadAndValidateReport();
@@ -542,23 +571,7 @@ export function runVenueVerification(): VenueVerificationReport {
     );
     const errors = [
       ...reportErrors,
-      ...fixtureResults.flatMap((result) => {
-        const fixture = result.fixture;
-        const extra =
-          fixture === null
-            ? []
-            : [
-                ...(fixture.retrieved === snapshotDateOf(check)
-                  ? []
-                  : [
-                      `retrieved must be ${snapshotDateOf(check)}, the snapshot date of ${reportOf(check)}`,
-                    ]),
-                ...(check.assert?.(fixture) ?? []),
-              ];
-        return [...result.errors, ...extra].map(
-          (error) => `${result.relativePath}: ${error}`,
-        );
-      }),
+      ...fixtureResults.flatMap((result) => fixtureCheckErrors(check, result, checkReport)),
     ];
     return {
       check,

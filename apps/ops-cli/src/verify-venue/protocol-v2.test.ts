@@ -20,13 +20,17 @@ import {
   decodeFeedCursor,
   duplicateKeys,
   evaluatePins,
+  PUBLIC_MARKET_CURSORS,
+  SIDECAR_PARAMETER_TYPES,
   feedUrlErrors,
+  fixturePersonalDataErrors,
   isFeedCapture,
   isLabelledSyntheticHex,
   isLabelledSyntheticText,
   loadCapture,
   marketReadConditionIds,
   marketReadTokenIds,
+  nonFeedUrlErrors,
   parseSourceIndex,
   personalValueErrors,
   readsAsFeedRoute,
@@ -39,6 +43,7 @@ import {
   unexplainedHashRuns,
   urlRouteOf,
   validateCapture,
+  venueCursorAnchorErrors,
 } from "./captures.js";
 import type {
   CaptureContext,
@@ -64,10 +69,11 @@ import {
   loadFixture,
   validateFixtureDocument,
 } from "./fixtures.js";
-import type { FixtureFile } from "./fixtures.js";
+import type { FixtureFile, FixtureValidationResult } from "./fixtures.js";
 import {
   captureContextOf,
   claimedFixturePaths,
+  fixtureCheckErrors,
   fixtureCoverage,
   formatVenueVerificationReport,
   listFixtureFiles,
@@ -152,6 +158,20 @@ function unknownParameterError(key: string, route: string): string {
 /** Round 5: a query on a route for which the gate knows no parameter. */
 function unknownRouteError(route: string): string {
   return `sidecar.url: the gate knows no query parameter of ${route} (SIDECAR_QUERY_PARAMETERS), so it cannot judge the query and fails closed (round 5)`;
+}
+
+/**
+ * Round 6 (V2-9-R6-02): a non-feed sidecar URL that is not its report
+ * source-index URL (or, for a URL the index cuts with `…`, does not extend
+ * the text before it).
+ */
+function unboundUrlError(id: string, cut = false): string {
+  return `sidecar.url: must be ${id}'s URL in the report's source index${cut ? " (or extend the text before its …)" : ""}, so that the report vouches for every identifier in it (round 6)`;
+}
+
+/** Round 6: a non-feed query value that is not of its parameter's type. */
+function valueTypeError(key: string, description: string): string {
+  return `sidecar url ${key}: the value is not ${description}, so the gate cannot judge it and fails closed (round 6)`;
 }
 
 /** Round 5: a fragment or a credential in an `https` sidecar URL. */
@@ -731,6 +751,8 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
       unknownParameterError("note", "https://data-api.polymarket.com/v2/oi"),
       "sidecar.url: an email address may not be committed (personal data)",
       "sidecar.url: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
+      // Round 6: the report no longer vouches for the URL.
+      unboundUrlError("S-A06"),
     ]);
   });
 
@@ -879,6 +901,7 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
     expect(named.errors).toEqual([
       unknownParameterError("name", "https://gamma-api.polymarket.com/events/keyset"),
       "sidecar.url: name is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+      unboundUrlError("S-G05"),
     ]);
     const encoded = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}&pseudo%6Eym=Real-Handle`;
@@ -886,6 +909,7 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
     expect(encoded.errors).toEqual([
       unknownParameterError("pseudonym", "https://gamma-api.polymarket.com/events/keyset"),
       "sidecar.url: pseudonym is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+      unboundUrlError("S-G05"),
     ]);
     // The personal scan passes a labelled synthetic value; round 5 refuses
     // the parameter alone, which the gate does not know for the route.
@@ -894,6 +918,7 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
     });
     expect(synthetic.errors).toEqual([
       unknownParameterError("name", "https://gamma-api.polymarket.com/events/keyset"),
+      unboundUrlError("S-G05"),
     ]);
     const fullWidth = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
       sidecar["notes"] = `${sidecar["notes"] as string} Contact reviewer-probe\uFF20example.invalid.`;
@@ -1745,6 +1770,7 @@ describe("V2-9 r4: the report's source index, not the sidecar's spelling, select
     });
     expect(swapped.errors).toEqual([
       routeError("S-A06", "https://data-api.polymarket.com/v2/oi", "https://data-api.polymarket.com/v2/resolutions"),
+      unboundUrlError("S-A06"),
     ]);
     let respelledUrl = "";
     const respelled = validateEdited("gamma-market-v1-btc15m.jsonc", undefined, (sidecar) => {
@@ -1754,6 +1780,7 @@ describe("V2-9 r4: the report's source index, not the sidecar's spelling, select
     expect(respelled.errors).toEqual([
       canonicalError(respelledUrl),
       routeError("S-G04", "https://gamma-api.polymarket.com/markets/5308512", "https://gamma-api.polymarket.com/m%61rkets/5308512"),
+      unboundUrlError("S-G04"),
     ]);
     for (const url of [
       "https://clob.polymarket.com/./book?token_id=1",
@@ -1824,6 +1851,7 @@ describe("V2-9 r5: what the scanner cannot decode, parse or read fails the gate 
       unknownParameterError("memo", BOOK_ROUTE),
       unknownParameterError("unused", BOOK_ROUTE),
       undecodable("sidecar.url", NOT_UTF8),
+      unboundUrlError("S-L03"),
     ]);
     // The decode path alone: the personal-data scan of the URL names the
     // failure; it no longer falls back to the raw URL and passes.
@@ -1841,6 +1869,7 @@ describe("V2-9 r5: what the scanner cannot decode, parse or read fails the gate 
       unknownParameterError("memo", BOOK_ROUTE),
       unknownParameterError("unused", BOOK_ROUTE),
       undecodable("sidecar.url", NOT_UTF8),
+      unboundUrlError("S-L03"),
     ]);
     const probe = sidecarWithUrl(BOOK_V2, (url) => `${url}${R5_WALLET_PROBE}${R5_MALFORMED}`);
     expect(sidecarPersonalDataErrors(probe, "", false)).toEqual([undecodable("sidecar.url", NOT_UTF8)]);
@@ -1858,7 +1887,13 @@ describe("V2-9 r5: what the scanner cannot decode, parse or read fails the gate 
       const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
         sidecar["url"] = `${sidecar["url"] as string}${suffix}`;
       });
-      expect(result.errors, suffix).toEqual([undecodable("sidecar.url", failure)]);
+      expect(result.errors, suffix).toEqual([
+        undecodable("sidecar.url", failure),
+        // Round 6: the report does not vouch for the URL, and the value
+        // (leniently decoded by WHATWG) is not a decimal token id.
+        unboundUrlError("S-L03"),
+        valueTypeError("token_id", "a decimal token id"),
+      ]);
     }
   });
 
@@ -1981,21 +2016,25 @@ describe("V2-9 r5: what the scanner cannot decode, parse or read fails the gate 
     const fragment = validateEdited(BOOK_V2, undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}#bids`;
     });
-    expect(fragment.errors).toEqual([FRAGMENT_ERROR]);
+    expect(fragment.errors).toEqual([FRAGMENT_ERROR, unboundUrlError("S-L03")]);
     const parameter = validateEdited(BOOK_V2, undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}&memo=synthetic-memo`;
     });
-    expect(parameter.errors).toEqual([unknownParameterError("memo", BOOK_ROUTE)]);
+    expect(parameter.errors).toEqual([unknownParameterError("memo", BOOK_ROUTE), unboundUrlError("S-L03")]);
     const route = validateEdited("gamma-market-v1-btc15m.jsonc", undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}?include_tag=true`;
     });
-    expect(route.errors).toEqual([unknownRouteError("https://gamma-api.polymarket.com/markets/5308512")]);
+    expect(route.errors).toEqual([
+      unknownRouteError("https://gamma-api.polymarket.com/markets/5308512"),
+      unboundUrlError("S-G04"),
+    ]);
     const wallet = validateEdited("data-v2-oi-v2.jsonc", undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}&proxyWallet=0x${"0".repeat(36)}0101`;
     });
     expect(wallet.errors).toEqual([
       "sidecar.url: a Data API read keyed by a wallet (proxyWallet=) may not be committed",
       unknownParameterError("proxyWallet", "https://data-api.polymarket.com/v2/oi"),
+      unboundUrlError("S-A06"),
     ]);
   });
 
@@ -2472,5 +2511,388 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
     expect(fixtureText("protocol-v2/README.md")).toContain(
       "round 5 fails closed on what the scanner cannot decode, parse or read",
     );
+  });
+});
+
+// --- round 6: fixture envelopes, and venue cursors and ids outside the feeds ------
+//
+// V2-9-R6-01: the two new JSON fixtures (and every other fixture envelope)
+// were validated without the personal-data scan. V2-9-R6-02: a capture that
+// is not a feed admitted a trade cursor in its sidecar prose and any value
+// under a known URL parameter. The probe values are SYNTHETIC (invented).
+
+/** The verifier's round-6 trade cursor, byte for byte: invented values, a zero signature. */
+const R6_TRADE_ANCHOR_JSON = JSON.stringify({
+  data: { type: "trades", params: { l: 2, ts: 1700000001, sq: 123, d: "desc" } },
+  sig: "0".repeat(64),
+});
+const R6_TRADE_ANCHOR = Buffer.from(R6_TRADE_ANCHOR_JSON).toString("base64url");
+const R6_WALLET = `0x${"1a".repeat(20)}`;
+const R6_HASH = `0x${"a".repeat(64)}`;
+const R6_TX_HASH = "0x9f2c1a7d3e5b4c6a8d0e2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e";
+
+/** The round-6 refusal of a venue cursor outside the feeds. */
+function anchorError(where: string, ...types: readonly string[]): string {
+  return `${where}: a token decodes to a venue cursor (type ${types.map((type) => JSON.stringify(type)).join(", ")}), which carries the seek anchor of a feed's last row (S-O06); outside the trade and activity feeds only a public market cursor classified for the route (PUBLIC_MARKET_CURSORS) may be committed`;
+}
+
+/** The round-6 long-id refusal of a fixture envelope's notes (or, `prose`, a payload text). */
+function fixtureLongIdError(where: string, prose = false): string {
+  return `${where}: a hex id, hash or number of 40 or more digits ${prose ? "in prose " : ""}that is not a labelled synthetic value, that no payload carries as a value and that the report does not record; name it by placeholder`;
+}
+
+/** The report a check is validated against, as the gate reads it. */
+function reportTextOf(check: VenueCheck): string {
+  return readFileSync(join(REPO_ROOT, reportOf(check)), "utf8");
+}
+
+/**
+ * The gate's refusals of one fixture-kind check's first file, with the
+ * envelope edited in memory (`index.ts` `fixtureCheckErrors`, the path the
+ * CLI runs). The payload validation is of the committed file.
+ */
+/** A fixture envelope a test may edit in memory. */
+type EditableFixture = { -readonly [K in keyof FixtureFile]: FixtureFile[K] };
+
+function fixtureCheckEdited(checkId: string, edit: (fixture: EditableFixture) => void = () => undefined): string[] {
+  const check = checkById(checkId);
+  const loaded = loadFixture(check.fixtures[0] as string, check.payloadSpec);
+  expect(loaded.fixture, loaded.errors.join("; ")).not.toBeNull();
+  const fixture: EditableFixture = structuredClone(loaded.fixture as FixtureFile);
+  edit(fixture);
+  const result: FixtureValidationResult = { ...loaded, fixture };
+  return fixtureCheckErrors(check, result, reportTextOf(check));
+}
+
+/** The market ids the gate corroborates (`captureContextOf`). */
+const R6_IDS = {
+  conditionIds: new Set(CONTEXT.marketConditionIds ?? []),
+  tokenIds: new Set(CONTEXT.marketTokenIds ?? []),
+};
+
+const BOOK_FIXTURE = "market-ws/book-snapshot-v2.json";
+const ROUTER_FIXTURE = "positions/router-v2.json";
+const PRICES_PAGE1 = "data-v2-prices-history-page1.jsonc";
+const PRICES_PAGE2 = "data-v2-prices-history-page2.jsonc";
+
+describe("V2-9 r6: every fixture envelope is scanned for personal data, cursors and long ids (V2-9-R6-01)", () => {
+  it("passes: every committed fixture envelope of every fixture-kind check", () => {
+    for (const check of VENUE_CHECKS.filter((candidate) => candidate.kind === "fixture")) {
+      for (const path of check.fixtures) {
+        const loaded = loadFixture(path, check.payloadSpec);
+        expect(fixtureCheckErrors(check, loaded, reportTextOf(check)), path).toEqual([]);
+      }
+    }
+  });
+
+  it("MUTANT (verifier probe): a wallet appended to the V2 book fixture's notes is refused", () => {
+    expect(
+      fixtureCheckEdited("market-ws-book-v2", (fixture) => {
+        fixture.notes += ` Captured wallet: ${R6_WALLET}`;
+      }),
+    ).toEqual([
+      `${BOOK_FIXTURE}: ${addressError("notes")}`,
+      `${BOOK_FIXTURE}: notes: wallet is written with a value that is not a labelled synthetic value, a <placeholder> or empty`,
+    ]);
+  });
+
+  it("MUTANT (verifier probe): an email appended to the Router fixture's notes is refused", () => {
+    expect(
+      fixtureCheckEdited("position-operations-v2", (fixture) => {
+        fixture.notes += " Contact: probe@example.test";
+      }),
+    ).toEqual([`${ROUTER_FIXTURE}: notes: an email address may not be committed (personal data)`]);
+  });
+
+  it("MUTANT: a transaction hash in the notes or in payload prose is refused; the report's digest and a payload's own id are not", () => {
+    expect(
+      fixtureCheckEdited("position-operations-v2", (fixture) => {
+        fixture.notes += ` Executed in ${R6_TX_HASH}.`;
+      }),
+    ).toEqual([`${ROUTER_FIXTURE}: ${fixtureLongIdError("notes")}`]);
+    expect(
+      fixtureCheckEdited("position-operations-v2", (fixture) => {
+        const payload = (fixture.examples[0] as { payload: Record<string, unknown> }).payload;
+        payload["description"] = `${payload["description"] as string} Receipt ${R6_TX_HASH.slice(2)}.`;
+      }),
+    ).toEqual([
+      `${ROUTER_FIXTURE}: ${fixtureLongIdError("examples contract-addresses-v2-proxies payload.description", true)}`,
+    ]);
+    // The book notes cite the S-W01 session's sha256, which the report records.
+    const book = loadedFixture(BOOK_FIXTURE);
+    expect(book.notes).toContain("3024eabbb25ef7f514bba9b93deee7b5b96690f72fc4cf3a8eba41f2a5293445");
+    expect(fixturePersonalDataErrors(book, PUBLIC_CONTRACT_ADDRESSES, V2_REPORT)).toEqual([]);
+    expect(fixturePersonalDataErrors(book, PUBLIC_CONTRACT_ADDRESSES, "")).toEqual([fixtureLongIdError("notes")]);
+    // A position id the payload carries as a whole value may be named in prose.
+    const router: EditableFixture = loadedFixture(ROUTER_FIXTURE);
+    router.notes += ` The YES id is ${(router.examples.find((example) => example.name.startsWith("derive"))?.payload["position_id"] as string)}.`;
+    expect(fixturePersonalDataErrors(router, PUBLIC_CONTRACT_ADDRESSES, V2_REPORT)).toEqual([]);
+  });
+
+  it("MUTANT: a trade cursor in the notes or a payload string, in any written form, is refused", () => {
+    for (const written of [
+      `cursor=${R6_TRADE_ANCHOR}`,
+      `cursor${R6_TRADE_ANCHOR}`,
+      R6_TRADE_ANCHOR_JSON,
+      Buffer.from(R6_TRADE_ANCHOR_JSON).toString("hex"),
+      encodeURIComponent(R6_TRADE_ANCHOR_JSON),
+    ]) {
+      const errors = fixtureCheckEdited("market-ws-book-v2", (fixture) => {
+        fixture.notes += ` Original ${written}`;
+      });
+      expect(errors, written).toContain(`${BOOK_FIXTURE}: ${anchorError("notes", "trades")}`);
+    }
+    expect(
+      fixtureCheckEdited("position-operations-v2", (fixture) => {
+        const payload = (fixture.examples[0] as { payload: Record<string, unknown> }).payload;
+        payload["description"] = `${payload["description"] as string} next ${R6_TRADE_ANCHOR}`;
+      }),
+    ).toEqual([`${ROUTER_FIXTURE}: ${anchorError("examples contract-addresses-v2-proxies payload.description", "trades")}`]);
+  });
+
+  it("MUTANT: a wallet or an email in a payload string, a payload key, an example name or the source is refused", () => {
+    const errors = fixtureCheckEdited("position-operations-v2", (fixture) => {
+      const example = fixture.examples[0] as { name: string; payload: Record<string, unknown> };
+      example.payload["description"] = `${example.payload["description"] as string} Sent from ${R6_WALLET}.`;
+      example.payload[`probe@example.test`] = "x";
+      example.payload["proxy_wallet"] = R6_WALLET;
+      example.name = `${example.name}-${R6_WALLET}`;
+      fixture.source = `${fixture.source}?ref=probe@example.test`;
+    });
+    const name = `contract-addresses-v2-proxies-${R6_WALLET}`;
+    for (const expected of [
+      `${ROUTER_FIXTURE}: source: an email address may not be committed (personal data)`,
+      `${ROUTER_FIXTURE}: ${addressError(`examples ${name} name`)}`,
+      `${ROUTER_FIXTURE}: ${addressError(`examples ${name} payload.description`)}`,
+      `${ROUTER_FIXTURE}: examples ${name} payload key: an email address may not be committed (personal data)`,
+      `${ROUTER_FIXTURE}: examples ${name} payload.proxy_wallet: a wallet must be a labelled synthetic address (0x00…), not a live value`,
+    ]) {
+      expect(errors, expected).toContain(expected);
+    }
+  });
+
+  it("MUTANT: a fixture text the scanner cannot decode fails by name, and a percent-encoded email is read decoded", () => {
+    for (const [suffix, failure] of [
+      [" probe %FF", NOT_UTF8],
+      [" probe %E2%82", NOT_UTF8],
+    ] as const) {
+      expect(
+        fixtureCheckEdited("position-operations-v2", (fixture) => {
+          fixture.notes += suffix;
+        }),
+        suffix,
+      ).toEqual([`${ROUTER_FIXTURE}: ${undecodable("notes", failure)}`]);
+    }
+    expect(
+      fixtureCheckEdited("position-operations-v2", (fixture) => {
+        fixture.notes += " probe%40example.test";
+      }),
+    ).toEqual([`${ROUTER_FIXTURE}: notes: an email address may not be committed (personal data)`]);
+  });
+
+  it("MUTANT: the scan covers every fixture envelope, the heartbeat's and the 2026-08-24 baseline's", () => {
+    expect(
+      fixtureCheckEdited("heartbeat", (fixture) => {
+        fixture.notes += " Contact: probe@example.test";
+      }),
+    ).toEqual(["heartbeat/heartbeat.json: notes: an email address may not be committed (personal data)"]);
+    expect(
+      fixtureCheckEdited("geoblock", (fixture) => {
+        fixture.notes += ` Seen from ${R6_WALLET}.`;
+      }),
+    ).toEqual([`geoblock/geoblock.json: ${addressError("notes")}`]);
+  });
+
+  it("MUTANT: a pasted transaction hash under a transaction-hash key, at any depth of any fixture payload, is refused", () => {
+    expect(
+      fixtureCheckEdited("rest-trade-settlement", (fixture) => {
+        const payload = (fixture.examples[0] as { payload: Record<string, unknown> }).payload;
+        payload["transaction_hash"] = R6_TX_HASH;
+      }),
+    ).toEqual([
+      "orders/rest-trades.json: examples rest-trade-matched-not-broadcasted payload.transaction_hash: a transaction hash must be a labelled synthetic hash (0x00…) or empty",
+    ]);
+    const nested = fixtureCheckEdited("position-operations", (fixture) => {
+      const example = fixture.examples.find((candidate) =>
+        JSON.stringify(candidate.payload).includes('"transactionHash"'),
+      ) as { name: string; payload: Record<string, unknown> };
+      const text = JSON.stringify(example.payload).replace(
+        /"transactionHash":"0x0+50\d"/,
+        `"transactionHash":"${R6_TX_HASH}"`,
+      );
+      example.payload = JSON.parse(text) as Record<string, unknown>;
+    });
+    expect(nested).toHaveLength(1);
+    expect(nested[0]).toMatch(/transactionHash: a transaction hash must be a labelled synthetic hash \(0x00…\) or empty$/);
+  });
+
+  it("the V1 CTF fixture passes on its own report: its V1 contracts are the ones the 2026-08-24 report records", () => {
+    const check = checkById("position-operations");
+    const fixture = loadedFixture(check.fixtures[0] as string);
+    expect(fixturePersonalDataErrors(fixture, PUBLIC_CONTRACT_ADDRESSES, reportTextOf(check))).toEqual([]);
+    // Without its report, the four V1 contract addresses are unvouched.
+    expect(
+      fixturePersonalDataErrors(fixture, PUBLIC_CONTRACT_ADDRESSES, "").filter((error) => error.includes("0x 40-hex address")),
+    ).toHaveLength(4);
+    // A hash written under a hash label is judged by its value: the notes'
+    // `transactionHash: TxHash` type passes, a real-shaped hash does not.
+    expect(fixture.notes).toContain("outcome.transactionHash: TxHash");
+    const pasted = { ...fixture, notes: `${fixture.notes} transactionHash: ${R6_TX_HASH}` };
+    expect(fixturePersonalDataErrors(pasted, PUBLIC_CONTRACT_ADDRESSES, reportTextOf(check))).toEqual([
+      fixtureLongIdError("notes"),
+    ]);
+  });
+});
+
+describe("V2-9 r6: outside the feeds, the report vouches for the URL, and a trade cursor is refused (V2-9-R6-02)", () => {
+  it("MUTANT (verifier probe): a trade cursor appended to a non-feed sidecar's notes is refused", () => {
+    const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Original cursor=${R6_TRADE_ANCHOR}`;
+    });
+    expect(result.errors).toEqual([anchorError("sidecar.notes", "trades")]);
+  });
+
+  it("MUTANT (verifier probe): a hash for a non-feed token_id is refused", () => {
+    const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace(/token_id=[^&]+/, `token_id=${R6_HASH}`);
+    });
+    expect(result.errors).toEqual([unboundUrlError("S-L03"), valueTypeError("token_id", "a decimal token id")]);
+  });
+
+  it("MUTANT: a trade cursor in any non-feed sidecar text, in any written form, is refused", () => {
+    for (const written of [
+      R6_TRADE_ANCHOR_JSON,
+      Buffer.from(R6_TRADE_ANCHOR_JSON).toString("hex"),
+      Buffer.from(R6_TRADE_ANCHOR_JSON).toString("base64"),
+      `next_cursor%3D${R6_TRADE_ANCHOR}`,
+      SYNTHETIC_SEEK_ANCHOR_CURSOR,
+    ]) {
+      const notes = validateEdited("gamma-market-v1-btc15m.jsonc", undefined, (sidecar) => {
+        sidecar["notes"] = `${sidecar["notes"] as string} ${written}`;
+      });
+      expect(notes.errors, written).toContain(anchorError("sidecar.notes", "trades"));
+    }
+    const redaction = validateEdited("ws-market-v2-session.jsonl", undefined, (sidecar) => {
+      sidecar["redactions"] = [...(sidecar["redactions"] as string[]), `cursor: was ${R6_TRADE_ANCHOR}`];
+    });
+    expect(redaction.errors).toContain(anchorError(`sidecar.redactions[${(sidecarOf(captureSpec("ws-market-v2-session.jsonl"))["redactions"] as string[]).length}]`, "trades"));
+    const rule = validateEdited("gamma-market-v2-docs-example.jsonc", undefined, (sidecar) => {
+      const extract = sidecar["extract"] as Record<string, unknown>;
+      extract["rule"] = `${extract["rule"] as string}; cursor ${R6_TRADE_ANCHOR}`;
+    });
+    expect(rule.errors).toEqual([anchorError("sidecar.extract.rule", "trades")]);
+  });
+
+  it("MUTANT: only a public market cursor classified for its route passes; a trade cursor, an untyped one, or one off its route is refused", () => {
+    expect(PUBLIC_MARKET_CURSORS).toEqual([
+      { type: "prices_history", route: "https://data-api.polymarket.com/v2/prices-history" },
+    ]);
+    // The committed page-2 URL carries the page-1 prices_history cursor.
+    const committed = sidecarOf(captureSpec(PRICES_PAGE2))["url"] as string;
+    const pricesCursor = /cursor=([^&]+)/.exec(committed)?.[1] as string;
+    expect((decodeFeedCursor(pricesCursor) as { data: { type: string } }).data.type).toBe("prices_history");
+    expect(validateEdited(PRICES_PAGE2).errors).toEqual([]);
+    const swapped = validateEdited(PRICES_PAGE2, undefined, (sidecar) => {
+      sidecar["url"] = committed.replace(pricesCursor, R6_TRADE_ANCHOR);
+    });
+    expect(swapped.errors).toEqual([
+      anchorError("sidecar.url", "trades"),
+      valueTypeError("cursor", "a public market cursor classified for the route (PUBLIC_MARKET_CURSORS)"),
+    ]);
+    const untyped = Buffer.from(JSON.stringify({ data: { params: { ts: 1 } }, sig: "0" })).toString("base64url");
+    const page1 = validateEdited(PRICES_PAGE1, undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} next ${R6_TRADE_ANCHOR} or ${untyped}; page 2 ${pricesCursor}`;
+    });
+    expect(page1.errors).toEqual([anchorError("sidecar.notes", "trades", "")]);
+    // The prices_history cursor on a route it is not classified for.
+    const offRoute = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} see ${pricesCursor}`;
+    });
+    expect(offRoute.errors).toEqual([anchorError("sidecar.notes", "prices_history")]);
+    expect(venueCursorAnchorErrors(`x ${pricesCursor}`, "t", "https://data-api.polymarket.com/v2/prices-history")).toEqual([]);
+    expect(venueCursorAnchorErrors("x %FF", "t", "")).toEqual([undecodable("t (cursor scan)", NOT_UTF8)]);
+  });
+
+  it("MUTANT: a trade cursor in a non-feed capture's string is refused", () => {
+    const result = validateEdited("ws-market-v2-session.jsonl", (text) =>
+      text.replace("Will North Carolina", `Will North Carolina ${R6_TRADE_ANCHOR}`),
+    );
+    expect(result.errors).toEqual([anchorError("$[11].frame.question", "trades")]);
+  });
+
+  it("MUTANT: a non-feed URL is its report's: a swapped condition, path id or token id is refused", () => {
+    const condition = validateEdited("data-v2-oi-v2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace(/condition=[^&]+/, `condition=${R6_TX_HASH}`);
+    });
+    expect(condition.errors).toEqual([
+      unboundUrlError("S-A06"),
+      "sidecar url condition: the value carries a hash-shaped run that is not a market id the report read (round 6)",
+    ]);
+    const path = validateEdited("clob-markets-v2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace(/0x[0-9a-f]+$/, R6_TX_HASH);
+    });
+    expect(path.errors).toContain(unboundUrlError("S-L01"));
+    const token = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace(/token_id=[^&]+/, "token_id=1234567890");
+    });
+    expect(token.errors).toEqual([unboundUrlError("S-L03")]);
+  });
+
+  it("MUTANT: past the report's cut (…), each value has its type; a hash rides on none", () => {
+    const limit = validateEdited(PRICES_PAGE1, undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace("limit=3", `limit=${R6_HASH}`);
+    });
+    expect(limit.errors).toEqual([valueTypeError("limit", "an integer of at most 4 digits")]);
+    const row = CONTEXT.sourceIndex.get("S-A02");
+    expect(row?.url).toContain("…");
+    const base = sidecarOf(captureSpec(PRICES_PAGE1))["url"] as string;
+    expect(nonFeedUrlErrors(base, row, R6_IDS)).toEqual([]);
+    expect(nonFeedUrlErrors(`${base}&interval=${R6_HASH.slice(0, 20)}`, row, R6_IDS)).toEqual([
+      valueTypeError("interval", "a short duration (1 to 3 digits and m, h, d or w)"),
+    ]);
+    expect(nonFeedUrlErrors(`${base}&bucket_seconds=12345678901234567890123`, row, R6_IDS)).toEqual([
+      valueTypeError("bucket_seconds", "a positive integer of at most 7 digits"),
+    ]);
+    // A token id of the right type that the report did not read.
+    expect(nonFeedUrlErrors(`${base}&token_id=${"9".repeat(40)}`, row, R6_IDS)).toEqual([
+      "sidecar url token_id: the value carries a hash-shaped run that is not a market id the report read (round 6)",
+    ]);
+    // The url's own prefix must be the report's: a URL the index does not cut is matched whole.
+    expect(nonFeedUrlErrors(base.replace("interval=1h", "interval=1d"), row, R6_IDS)).toEqual([unboundUrlError("S-A02", true)]);
+    expect(Object.keys(SIDECAR_PARAMETER_TYPES).sort()).toEqual(
+      ["bucket_seconds", "closed", "condition", "cursor", "interval", "limit", "series_id", "token_id"],
+    );
+  });
+
+  it("the committed tree: every non-feed URL is its report's, with typed values and classified cursors", () => {
+    let checked = 0;
+    for (const spec of PROTOCOL_V2_CAPTURES) {
+      const sidecar = sidecarOf(spec);
+      const row = CONTEXT.sourceIndex.get(spec.sourceId);
+      if (isFeedCapture(sidecar["url"] as string, null, row?.url)) {
+        continue;
+      }
+      checked += 1;
+      expect(nonFeedUrlErrors(sidecar["url"] as string, row, R6_IDS), spec.fixture).toEqual([]);
+      for (const text of [sidecar["url"], sidecar["notes"], ...(sidecar["redactions"] as string[])] as string[]) {
+        expect(venueCursorAnchorErrors(text, spec.fixture, urlRouteOf(sidecar["url"] as string))).toEqual([]);
+      }
+    }
+    expect(checked).toBe(17);
+  });
+
+  it("round 6: the exception states the scanned fixture envelopes and the report-vouched non-feed URL (V2-9-R6-01, -02)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**Every fixture envelope is scanned** (round 6, V2-9-R6-01)",
+      "`fixturePersonalDataErrors`",
+      "**Outside the trade and activity pages** (round 6, V2-9-R6-02)",
+      "`PUBLIC_MARKET_CURSORS`",
+      "`SIDECAR_PARAMETER_TYPES`",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(readme).not.toContain("the gate does not type that\n  URL's values");
+    expect(fixtureText("protocol-v2/README.md")).toContain("round 6 binds each non-feed sidecar URL to its report");
   });
 });

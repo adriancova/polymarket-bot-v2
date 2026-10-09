@@ -407,6 +407,48 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
     `PING` or `PONG` sent or received, the market channel URL on the
     `open` record, or a `local-close` reason word;
   - a sidecar that is not valid UTF-8 fails.
+- **Outside the trade and activity pages** (round 6, V2-9-R6-02):
+  - the sidecar URL is the URL the report's source index records for the
+    catalogue source id, character for character, or, when the index cuts
+    it with `…`, extends the text before the `…`; so the report vouches for
+    every token id, condition and path id in it, and a hash or a wallet
+    cannot replace one;
+  - each query value has the type its parameter is listed with
+    (`SIDECAR_PARAMETER_TYPES`: decimal token ids, condition ids, short
+    integers and durations, booleans, and a classified market cursor), and,
+    but for that cursor, carries no hash-shaped run that is not a market id
+    the report read;
+  - no sidecar text (`url`, `notes`, each redaction, `extract.rule`) and no
+    capture string hides a venue cursor, in any of the written forms above,
+    unless it is a public market cursor classified for the capture's route
+    (`PUBLIC_MARKET_CURSORS`: today the `prices_history` cursor on
+    `/v2/prices-history`, S-A02 and S-A03). A trade or activity cursor, an
+    untyped one, or a market cursor off its route fails the gate.
+- **Every fixture envelope is scanned** (round 6, V2-9-R6-01). Each
+  fixture-kind check's files (the WP-000 envelope `{fixture, source,
+  retrieved, sanitized, notes, examples}`, today's and the 2026-08-24
+  baseline's alike) answer to the same scan as a capture and its sidecar
+  (`fixturePersonalDataErrors` in `captures.ts`):
+  - every envelope text (`fixture`, `source`, `retrieved`, `notes`, each
+    example `name`) and every payload string and key, in every reading
+    (NFKC and each percent-decoded layer; what cannot be decoded fails by
+    name): no email address, and no `0x` 40-hex address other than a
+    labelled synthetic one, a documented V2 contract address, or one the
+    check's report records (the 2026-08-24 report records the V1 CTF
+    contracts);
+  - every payload: the personal keys, as in a capture, and, at any depth, a
+    value under a transaction-hash key (`transaction_hash`,
+    `transactionHash`, `tx_hash`) is a labelled synthetic hash or empty;
+  - the notes and every payload text: no personal field written with a
+    value, and no token that decodes to a venue cursor (none is classified
+    outside a capture's route);
+  - the notes, and every payload string with a space (prose): no hex id,
+    hash or number of 40 or more digits that is not labelled synthetic,
+    unless a payload carries it as a whole value (an id its payload spec and
+    `assert` hook judge) or the check's report records it. A hash written
+    under a hash label (`transactionHash: …`) is judged so, by its value:
+    the V1 CTF notes' `outcome.transactionHash: TxHash` type passes, a
+    pasted transaction hash does not.
 - A sidecar of a trade or activity page with rows or a cursor lists
   `timestamp` and `next_cursor` among its redactions.
 - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
@@ -442,9 +484,10 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   than in hex or decimal (in base64, for example);
 - a personal key glued to a label by a letter or a digit
   (`maker1wallet: …`): it reads as another word, as `filename:` does;
-- the long ids in the URL of a capture that is not a trade or activity page:
-  its condition and token ids are public, and the gate does not type that
-  URL's values (round 5: it does refuse a parameter it does not know);
+- a whole-value id in a fixture payload (a `condition_id`, a `hash`): the
+  check's payload spec and `assert` hook judge it (the V2 book frame equals
+  its capture, the Router ids are the documentation's), not the envelope
+  scan, which reads long ids in prose only (round 6);
 - a personal value hidden by a deliberate re-encoding other than
   percent-encoding (round 5: per the 2026-10-08 ruling, such a bypass is a
   follow-up, not a gap of this gate);
