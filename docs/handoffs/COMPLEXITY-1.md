@@ -1,6 +1,6 @@
 # COMPLEXITY-1: complexity audit with fixes
 
-**Status:** Running (authorized by the user, 2026-10-08). This handoff is updated as each round merges.
+**Status:** Complete (2026-10-09). Authorized by the user on 2026-10-08. Seven rounds and two follow-up rounds merged via PRs #91-#98 (C1-V29 merged with V2-9).
 **Principle:** AGENTS.md "Design principle: proportionality", adopted 2026-10-08 (`3a2a77a`, formalized `5129b98`).
 **Scope (user):** everything, process included, as an audit and fixes in one go. Debatable items go to the user.
 
@@ -44,6 +44,7 @@
 | C1-UNIV | The trader imports universe's series code (§2.1 row S19, trading-core → universe; the one lockfile importer entry); its copy `series.ts`, `series.test.ts` and the mirror test deleted; universe's `outcomes` an array of exactly two (the arena copies no tuple); 3 config-door tests (hash equal to the gateway's, negRisk true and one or three outcomes refused); the trader's re-judge unchanged. Code and tests: +71/-866 lines | astra review pending (`c1-univ` r0) | — |
 | C1-TIDY | The COMPLEXITY-1 follow-ups: the halt `action` field and the `trader_halt_info` `action` label removed (the health door is strict, so a halt carrying one is refused); `bookRefusals` on the trader health snapshot and through the control-api door; `simulation.startingCash` deleted (the venue opens with `accounting.startingCash`; an old config is refused naming it; `crossFieldRefusal`'s cash branch and its tests gone); 5 small LOWs (planner's `TIME_IN_FORCE_VALUES`, two stale comments, the stale dashboard text, universe's `node:crypto` in §2.2). Replay-golden artifacts byte-identical. Code and tests: +152/-206 lines | Opus ACCEPT in round 1 (`f382e13`; standard tier: Sonnet implemented, one Opus reviewer; 5 LOWs, the dashboard wording fixed by the orchestrator, the rest follow-ups) | via PR #97 |
 | C1-OPS | The control API answers an audited 501 CONTROL_NOT_WIRED in PAPER; one PAPER compose stack (`infra/compose/paper`, its own project and ports); RecorderRtdsHalted deleted and the recorder fragments marked not deployable; `docs/runbooks/paper-operations.md`; the series messages corrected; the brief check and self-test in CI | astra ACCEPT on the second attempt (`a645c6d`) after the orchestrator widened a too-narrow grant and reverted a scope retreat; LOW R1-01 fixed (`b1db4f8`) | via PR #92 |
+| C1-OMS06 | One latch for reconciliation halts (audit OMS-06, the skeptic's amendment): the live entry gate derives its halts from the coordinator's journal at every ask, through `quarantinedBreaks()`, which throws when the journal cannot be read (`HALTS_UNREADABLE`, fail closed; never `status().unresolvedBreaks`); `HaltPort`/`HaltRequest`, `#deliverHalts`, `HALT_DELIVERY_FAILED` (43 break classes to 42), live-safety's latch and `releaseReconciliationHalts()`, and the ops-cli halts recorder deleted; one `releaseQuarantine` lifts exactly that break's halt; pins 5a-5e against the real coordinator; ADR-033 dated note. Production +72/-127 lines. Two forced doc edits were STOPPED and granted by the orchestrator (`3e303da`): the WP340-F1 release counts in `docs/experiments/phase-3-verification.md` §5 (the halt calls were crash kill points) and the emergency runbook's halt-port row | dual (Opus + astra) ACCEPT in round 1 (`3e303da`); 2 LOWs: the stale halt-port records, fixed; the tautological property check, a follow-up | via PR #98 |
 
 ## C1-PROC notes
 - **The orchestrator granted one STOPPED item:** the status archive's README now names the removed tools instead of documenting them (`2ad210f`).
@@ -84,3 +85,6 @@
   - `pipeline.ts` keeps a private `TIME_IN_FORCE_VALUES`; fold it into the planner's export on the next edit (R2-L4);
   - the stale "FAK taker" wording in `test/integration/paper-trader/support/fixture.ts` `restingEntryConfig` (R2-L2).
 - **Operators:** burn-in configs must move `immediate_order_type` from FAK to GTD, with an explicit `order_validity_ms`; a FAK/FOK entry is refused at startup (`SB_IMMEDIATE_ORDER_TYPE_PARKED_UNTIL_EXECUTION_PROBE`).
+
+## C1-OMS06 notes
+- **Follow-up (LOW R1-02):** the reconciliation property's "a quarantine is not halted" check in `test/fault-injection/reconciliation/support/property.ts` (around :1317-1321) now compares the journal's QUARANTINED set with itself, so it cannot fail. Delete it or re-aim it at the live gate. Fault pins 5a-5e carry the real coverage.

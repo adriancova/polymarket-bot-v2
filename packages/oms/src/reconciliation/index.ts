@@ -41,8 +41,6 @@ export {
   type BreakRule as ReconciliationBreakRule,
   type BreakScope as ReconciliationBreakScope,
   type FillIdentity,
-  type HaltPort,
-  type HaltRequest,
   type HoldingsPort,
   type JournalBreakView,
   type JournalInput,

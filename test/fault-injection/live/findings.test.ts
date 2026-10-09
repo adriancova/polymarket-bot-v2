@@ -116,7 +116,7 @@ describe("WP340-F1 (STOPPED), route 2: a frame that lags a read, with nothing lo
     const { world, node, oms } = await laggingPlacementAfterFill();
     expect(oms.alerts()).toEqual([]);
     expect(await reconcileUntilResumed(world, node, 3)).toBe(true);
-    expect(world.u.halts).toEqual([]);
+    expect(node.coordinator.quarantinedBreaks()).toEqual([]);
   });
 
   it("TODAY, WP340-F1 (lagging frame): the stale LIVE raises the halting alert, the market is quarantined, and an operator's release resumes a consistent account", async () => {
@@ -153,7 +153,7 @@ describe("WP340-F1 (STOPPED), route 3: a cancel answered before the order's PLAC
     const { world, node, oms } = await cancelledBeforeItsPlacementFrame();
     expect(oms.alerts()).toEqual([]);
     expect(await reconcileUntilResumed(world, node, 3)).toBe(true);
-    expect(world.u.halts).toEqual([]);
+    expect(node.coordinator.quarantinedBreaks()).toEqual([]);
   });
 
   it("TODAY, WP340-F1 (cancel before the frame): the late LIVE raises the halting alert and the market is quarantined until an operator releases it", async () => {
@@ -178,7 +178,7 @@ describe("WP340-F1 (STOPPED): a retained stream observation drained after a term
       const { world, node } = await lostAnswerThenCompleted(complete);
       const resumed = await reconcileUntilResumed(world, node, 6);
       expect(node.journal.unresolvedBreaks().map((view) => view.breakClass)).toEqual([]);
-      expect(world.u.halts).toEqual([]);
+      expect(node.coordinator.quarantinedBreaks()).toEqual([]);
       expect(resumed).toBe(true);
     });
 
@@ -189,8 +189,8 @@ describe("WP340-F1 (STOPPED): a retained stream observation drained after a term
       expect(oms.alerts()).toEqual([expect.objectContaining({ kind: "EVIDENCE_CONFLICT", haltMarket: true, detail: WP340_F1_DETAIL })]);
       const quarantined = node.journal.unresolvedBreaks();
       expect(quarantined.map((view) => [view.breakClass, view.status])).toEqual([["OMS_HALTING_ALERT", "QUARANTINED"]]);
-      expect(world.u.halts.every((halt) => halt.breakId === quarantined[0]?.breakId)).toBe(true);
-      expect(world.u.halts.length).toBeGreaterThan(0);
+      // The halt the live gate reads (C1-OMS06): that one quarantine, and nothing else.
+      expect(node.coordinator.quarantinedBreaks().map((view) => view.breakId)).toEqual([quarantined[0]?.breakId]);
       // Fail-closed: a new order is refused while it holds.
       const refused = await oms.submit(ticket(G, { n: 2, shares: "1" }));
       expect(refused.ok).toBe(false);

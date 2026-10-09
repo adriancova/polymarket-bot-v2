@@ -106,7 +106,7 @@ def residual_owner_dash(text):
 
 # (name, [(file, mutation)], the report line that must appear)
 MUTATIONS = [
-    ("the brief over 30 KB", [(STATUS, lambda t: t + "\n" + "x" * 12_000 + "\n")], "K1:"),
+    ("the brief over 30 KB", [(STATUS, lambda t: t + "\n" + "x" * 31_000 + "\n")], "K1:"),
     ("the brief loses its Human items section", [(STATUS, replace("## Human items", "## People items"))],
      "K2: the brief has no section '## Human items'"),
     ("the safety state weakens one default", [(STATUS, replace("- `ALLOW_REAL_ORDERS=false`", "- `ALLOW_REAL_ORDERS=true`"))],

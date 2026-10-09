@@ -31,7 +31,7 @@
  * Every port call an incarnation makes is counted by WP-290's `Incarnation`
  * (imported read-only): store transactions and loads, the cipher, the
  * reservations, the reconciliation requests, the OMS's venue calls, the
- * coordinator's reads, journal appends, ledger calls and halts, AND the
+ * coordinator's reads, journal appends and ledger calls, AND the
  * SDK-level steps beneath WP-260's client that the mock CLOB exposes as
  * checkpoints: the signer call (mid-signing), the venue's receipt
  * (mid-transmission), the venue's answer (mid-answer) and the heartbeat. A
@@ -49,7 +49,6 @@ import {
   VenueModeDetector,
   venueModeSource,
   withModeDetection,
-  type HaltPort,
   type OmsReservationPort,
   type OmsStore,
   type OmsVenuePort,
@@ -389,14 +388,14 @@ export interface NodeOptions {
   /**
    * A composition step run after the coordinator exists and BEFORE the OMS opens (WP-320's live root: the safety
    * composition is built over the coordinator and a lazy view of the OMS, then fences the OMS's venue). It may return
-   * venue and dependency wraps, and a halt port WP-290's halts are routed to as well.
+   * venue and dependency wraps. (Its gate reads WP-290's halts from the coordinator itself: `quarantinedBreaks`.)
    */
   readonly compose?: (parts: {
     readonly coordinator: ReconciliationCoordinator;
     readonly inc: Incarnation;
     readonly client: SecureVenueClient;
     readonly oms: () => OrderManager | null;
-  }) => { readonly wrapVenue?: (venue: OmsVenuePort) => OmsVenuePort; readonly wrapDependencies?: (deps: OrderManagerDependencies) => OrderManagerDependencies; readonly halts?: HaltPort };
+  }) => { readonly wrapVenue?: (venue: OmsVenuePort) => OmsVenuePort; readonly wrapDependencies?: (deps: OrderManagerDependencies) => OrderManagerDependencies };
 }
 
 export interface LiveNode {
@@ -493,8 +492,6 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
     clob.sdk(credential, { source, checkpoint, alive: () => inc.alive }),
   );
   const reads = clob.readPort();
-  // Where WP-290's halts are ALSO routed (the composition step's port), once it ran.
-  const routed: { halts: HaltPort | undefined } = { halts: undefined };
   const coordinator = new ReconciliationCoordinator({
     reads: {
       listOpenOrders: () => inc.call("read.openOrders", () => reads.listOpenOrders()),
@@ -535,18 +532,6 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
           return { ok: true };
         }),
     },
-    halts: {
-      haltMarket: (request) =>
-        inc.callSync("halt.market", () => {
-          u.halts.push(request);
-          routed.halts?.haltMarket(request);
-        }),
-      haltAccount: (request) =>
-        inc.callSync("halt.account", () => {
-          u.halts.push({ ...request, marketId: null });
-          routed.halts?.haltAccount(request);
-        }),
-    },
     clock: { now: () => time.epochMs() },
     newId: u.coordinatorIds,
     marketOfToken: (tokenId) => (tokenId === YES ? MARKET : tokenId === NO ? MARKET_NO : null),
@@ -573,7 +558,6 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
   }
   let oms: OrderManager | null = null;
   const composed = options.compose?.({ coordinator, inc, client, oms: () => oms }) ?? {};
-  routed.halts = composed.halts;
   if (options.wrapVenue !== undefined) venue = options.wrapVenue(venue);
   if (composed.wrapVenue !== undefined) venue = composed.wrapVenue(venue);
   const store: OmsStore = {

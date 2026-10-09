@@ -47,15 +47,22 @@ export interface SafetyRunReport {
 }
 
 /**
- * The slice of WP-290's `ReconciliationCoordinator` the lapse recovery uses
- * (ADR-033 D6 step 3–4): `trigger` holds the account and queues a run but
- * starts none; `reconcile` runs nothing (`NOT_RUN`) while a run is in
- * progress, which `status().running` reports. The coordinator owns no timer.
+ * The slice of WP-290's `ReconciliationCoordinator` the composition uses.
+ * The lapse recovery (ADR-033 D6 step 3–4): `trigger` holds the account and
+ * queues a run but starts none; `reconcile` runs nothing (`NOT_RUN`) while a
+ * run is in progress, which `status().running` reports. The coordinator owns
+ * no timer. The live gate (C1-OMS06): `quarantinedBreaks`.
  */
 export interface SafetyCoordinator {
   trigger(trigger: "POSITION_BALANCE_DISCREPANCY"): void;
   reconcile(): Promise<{ readonly runs: readonly SafetyRunReport[]; readonly resumed: boolean }>;
   status(): { readonly running: boolean };
+  /**
+   * The journal's QUARANTINED breaks, read at every call: the gate's reconciliation halts are derived from them (a
+   * MARKET-scope break with a market halts that market, any other the account). It THROWS when the journal cannot be
+   * read, never answering an empty list in its place: the gate then refuses new entries (`HALTS_UNREADABLE`).
+   */
+  quarantinedBreaks(): readonly { readonly scope: string; readonly marketId: string | null }[];
 }
 
 /** The order-heartbeat controller, as the composition reads it (`OrderHeartbeatController`). */

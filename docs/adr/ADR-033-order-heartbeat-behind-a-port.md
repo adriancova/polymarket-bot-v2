@@ -609,3 +609,25 @@ unsigned, credential-free `GET /v2/approvals` inside
 | §9.12 "Wrap only the official unified SDK" | Unchanged | One named exception: D5's `POST /v1/heartbeats`, on the user's ruling |
 | §9.12 "heartbeat orders" | `WP-320` built the controller behind a port; no transport | The transport is option 1, built pre-live |
 | Brief row `V3-C12-HEARTBEAT-ADR` | D5 open for the user | D5 ruled; its transport is owed before any mode above PAPER |
+
+## Note (2026-10-09, C1-OMS06)
+
+This note changes no Decision text above. It records one change to the live
+composition that D1 and D6 run in (`apps/trader/src/live-safety`, `WP-320`).
+
+- **Before.** The composition also exposed WP-290's halt port (`safety.halts`).
+  Each reconciliation run pushed every QUARANTINED break into it, and the
+  composition kept those halts in its own add-only latch. Only an operator's
+  `releaseReconciliationHalts()` cleared the latch, and it cleared every
+  market and the account at once. Nothing called it.
+- **Now.** The port, the latch and `releaseReconciliationHalts()` are gone,
+  and so is the coordinator's `HALT_DELIVERY_FAILED` break class
+  (`COMPLEXITY-1`, audit finding `OMS-06`).
+  - The live entry gate reads the coordinator's journal at every ask, through
+    `quarantinedBreaks()`. A `MARKET` break with a market blocks new entries
+    in that market. Any other break blocks new entries in the whole account.
+  - The read throws when the journal cannot be read, and the gate then refuses
+    the entry (`HALTS_UNREADABLE`).
+  - One `releaseQuarantine` lifts exactly that break's halt.
+- **Unchanged.** The heartbeat gate (D1) reads no reconciliation halt, as
+  before. The lapse recovery's use of the coordinator (D6) is also unchanged.

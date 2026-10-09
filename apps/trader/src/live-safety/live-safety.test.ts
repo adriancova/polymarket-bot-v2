@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   ACCOUNT,
   composition,
+  type Composition,
   engageRow,
   FakeBodyPort,
   FakeCancels,
@@ -1147,17 +1148,62 @@ describe("r4 R4-L1: a switch's reference is matched in its scope's canonical for
   });
 });
 
-describe("WP-290's halt port is routed into the gate (WP290-RESIDUALS: route the halt port)", () => {
-  it("an account halt and a market halt block new entries until an operator releases them", async () => {
+describe("C1-OMS06: the gate's reconciliation halts are the coordinator's QUARANTINED breaks, read at every ask", () => {
+  const OTHER = "0190a3e0-0000-7000-8000-00000000000d";
+  const halts = (c: Composition, kind: "NEW_ENTRY" | "REDUCTION", marketId: string): readonly string[] =>
+    c.safety.gate({ kind, marketId, instanceId: INSTANCE }).reasons.filter((reason) => reason.startsWith("RECONCILIATION_") || reason === "HALTS_UNREADABLE");
+
+  it("(5a) the journal unreadable: every new entry is refused (HALTS_UNREADABLE), and the status reads the account halted", async () => {
     const c = composition();
     await ready(c);
-    c.safety.halts.haltMarket({ marketId: "m-1" });
-    c.safety.halts.haltAccount({});
-    const reasons = c.safety.gate({ kind: "NEW_ENTRY", marketId: "m-1", instanceId: "i-1" }).reasons;
-    expect(reasons).toContain("RECONCILIATION_ACCOUNT_HALT");
-    expect(reasons).toContain("RECONCILIATION_MARKET_HALT");
-    c.safety.releaseReconciliationHalts();
-    const after = c.safety.gate({ kind: "NEW_ENTRY", marketId: "m-1", instanceId: "i-1" }).reasons;
-    expect(after).not.toContain("RECONCILIATION_ACCOUNT_HALT");
+    c.coordinator.quarantined = null;
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual(["HALTS_UNREADABLE"]);
+    expect(c.safety.status().reconciliationHalts).toEqual({ account: true, markets: [] });
+  });
+
+  it("(5b) a MARKET break blocks that market's entries only; an ACCOUNT break, or a MARKET break with no market, blocks every entry", async () => {
+    const c = composition();
+    await ready(c);
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual([]);
+    c.coordinator.quarantined = [{ scope: "MARKET", marketId: MARKET }];
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual(["RECONCILIATION_MARKET_HALT"]);
+    expect(halts(c, "NEW_ENTRY", OTHER)).toEqual([]);
+    expect(c.safety.status().reconciliationHalts).toEqual({ account: false, markets: [MARKET] });
+    c.coordinator.quarantined = [{ scope: "ACCOUNT", marketId: null }];
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual(["RECONCILIATION_ACCOUNT_HALT"]);
+    expect(halts(c, "NEW_ENTRY", OTHER)).toEqual(["RECONCILIATION_ACCOUNT_HALT"]);
+    // An ACCOUNT-scope break that names a market still halts the account, not that market.
+    c.coordinator.quarantined = [{ scope: "ACCOUNT", marketId: MARKET }];
+    expect(halts(c, "NEW_ENTRY", OTHER)).toEqual(["RECONCILIATION_ACCOUNT_HALT"]);
+    c.coordinator.quarantined = [{ scope: "MARKET", marketId: null }];
+    expect(halts(c, "NEW_ENTRY", OTHER)).toEqual(["RECONCILIATION_ACCOUNT_HALT"]);
+  });
+
+  it("(5c, unit) nothing is latched: a break gone from the journal stops blocking at the next ask, the others still block", async () => {
+    const c = composition();
+    await ready(c);
+    c.coordinator.quarantined = [
+      { scope: "MARKET", marketId: MARKET },
+      { scope: "MARKET", marketId: OTHER },
+    ];
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual(["RECONCILIATION_MARKET_HALT"]);
+    c.coordinator.quarantined = [{ scope: "MARKET", marketId: OTHER }];
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual([]);
+    expect(halts(c, "NEW_ENTRY", OTHER)).toEqual(["RECONCILIATION_MARKET_HALT"]);
+  });
+
+  it("(5e) reductions are never blocked by the reconciliation halts, nor by an unreadable journal", async () => {
+    const c = composition();
+    await ready(c);
+    c.coordinator.quarantined = [
+      { scope: "MARKET", marketId: MARKET },
+      { scope: "ACCOUNT", marketId: null },
+    ];
+    expect(halts(c, "NEW_ENTRY", MARKET)).toEqual(["RECONCILIATION_ACCOUNT_HALT", "RECONCILIATION_MARKET_HALT"]);
+    expect(halts(c, "REDUCTION", MARKET)).toEqual([]);
+    expect(c.safety.gate(REDUCE).permitted).toBe(true);
+    c.coordinator.quarantined = null;
+    expect(halts(c, "REDUCTION", MARKET)).toEqual([]);
+    expect(c.safety.gate(REDUCE).permitted).toBe(true);
   });
 });

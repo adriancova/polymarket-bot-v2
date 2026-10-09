@@ -28,7 +28,7 @@ import { compositeKey } from "../../../packages/oms/src/guards.js";
 import type { OrderManager } from "../../../packages/oms/src/index.js";
 import { group, ticket } from "../../unit/oms/support/harness.js";
 
-import { EXCHANGE, MARKET, PUSD, YES, boot, streamTrade } from "./support/harness.js";
+import { EXCHANGE, MARKET, PUSD, YES, boot, halted, streamTrade } from "./support/harness.js";
 import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
 /** The same universe, after a restart (a fresh process over what survives). */
@@ -697,7 +697,7 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     const second = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_FACTS_MISMATCH");
     expect(second?.breakId).not.toBe(first?.breakId);
     expect(second?.status).toBe("QUARANTINED");
-    expect(r.u.halts.some((halt) => halt.breakId === second?.breakId)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === second?.breakId)).toBe(true);
     // r7 (WP290-CX-R7-01): the venue's reads now show the order's price as the OMS signed it, after showing another:
     // the reads have shown one order's fixed facts two ways, a durable contradiction. The account stays held, its
     // quarantine released or not (no tool retracts evidence: runbook §10).
@@ -1539,7 +1539,7 @@ describe("WP-290 acceptance 1: a venue order seen once is never forgotten while 
     expect(reads).toContain(foreign.venueOrderId);
     const quarantined = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED");
     expect(quarantined).toMatchObject({ status: "QUARANTINED", marketId: MARKET });
-    expect(r.u.halts.some((halt) => halt.breakId === quarantined?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === quarantined?.breakId && halt.marketId === MARKET)).toBe(true);
   });
 });
 

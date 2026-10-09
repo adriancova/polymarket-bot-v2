@@ -6,7 +6,7 @@
 
 import {it,expect} from 'vitest';
 import {ready,submitOne,reconcileRounds} from '../support/scenario.js';
-import {boot} from '../support/harness.js';
+import {boot,halted} from '../support/harness.js';
 import { trace, type Loose } from "../support/loose.js";
 
 it('R3-A a missing trade cannot resolve its prior settlement regression',async()=>{
@@ -41,7 +41,7 @@ it('R3-B FAILED settlement persisted before a crash still requires quarantine on
  expect(killed).toBe(true);
  const p=await boot(r.u);
  const result=await p.coordinator.reconcile();
- trace('R3-B',JSON.stringify({result,alerts:p.oms?.alerts(),breaks:p.journal.breaks(),halts:r.u.halts,settlements:r.u.store.snapshotSync().settlements}));
+ trace('R3-B',JSON.stringify({result,alerts:p.oms?.alerts(),breaks:p.journal.breaks(),halts:halted(p),settlements:r.u.store.snapshotSync().settlements}));
  expect(result.resumed).toBe(false);
  expect(p.journal.unresolvedBreaks().length).toBeGreaterThan(0);
 });

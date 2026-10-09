@@ -387,7 +387,7 @@ Its class decides its rule. The full table, with every class's meaning, is
 
 | Rule | Who clears it | Classes |
 | --- | --- | --- |
-| `HOLD_UNTIL_CONSISTENT` | a later complete run that judged it again and no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_MISMATCH`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `SETTLEMENT_REVERSAL_OWED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `HALT_DELIVERY_FAILED`, `REQUEST_MALFORMED` |
+| `HOLD_UNTIL_CONSISTENT` | a later complete run that judged it again and no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_MISMATCH`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `SETTLEMENT_REVERSAL_OWED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `REQUEST_MALFORMED` |
 | `RESOLVE_IN_RUN` | the run that found it, once its fix is accepted | `TRADE_MISSING_IN_OMS` (a missed fill, delivered with its exact economics) |
 | `QUARANTINE_UNTIL_RELEASED` | an operator's release | `ORDER_FACTS_MISMATCH`, `ORDER_NOT_FOUND_BY_ID`, `SETTLEMENT_FAILED`, `OMS_HALTING_ALERT`, `WALLET_OPERATION_UNIDENTIFIABLE` |
 | `UNATTRIBUTED_HALT` | an operator's release, after the market (or account) was halted | `ORDER_UNATTRIBUTED`, `TRADE_UNATTRIBUTED`, `POSITION_UNATTRIBUTED`, `BALANCE_UNATTRIBUTED`, `LEDGER_UNATTRIBUTED_ARRIVAL` |
@@ -411,7 +411,7 @@ Anything not positively judged stays open:
 | an attempt's identity ambiguity, or a refused answer | that attempt judged without ambiguity, or an answer for it accepted, or nothing owed for it any more |
 | a wallet member (`WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`) | an answer for that member accepted, or its operation's request gone |
 | `REQUEST_MALFORMED` | a run its channel presented nothing malformed to |
-| a component, the clock, the journal, a halt delivery, retained evidence, an unsettled operation | that check passing in this run |
+| a component, the clock, the journal, retained evidence, an unsettled operation | that check passing in this run |
 
 **A malformed request** (from the OMS, the inventory or the user stream) is
 refused to its requester and recorded as `REQUEST_MALFORMED`, one break per
@@ -435,9 +435,17 @@ that component needs attention.
   be visible yet). Such a delta stays held instead. Any unresolved attempt
   could explain a collateral delta.
 
-Each UNATTRIBUTED break halts its market through the halt port. Collateral,
-or a token whose market is unknown, halts the account. The halt is delivered
-again by every run while the break is open: the halt port must be idempotent.
+Each UNATTRIBUTED break halts its market. Collateral, or a token whose market
+is unknown, halts the account. **How a quarantine halts** (C1-OMS06): the
+coordinator calls no halt port. The live gate (`WP-320`,
+`apps/trader/src/live-safety`) reads `coordinator.quarantinedBreaks()` at every
+entry decision: each QUARANTINED break of `MARKET` scope with a market blocks
+new entries in that market, and any other blocks new entries in the whole
+account. A break still `OPEN` blocks none through this read; the pause covers
+it, and a run quarantines an `OPEN` quarantine first. If the journal cannot be
+read, the call throws and the gate refuses every new entry
+(`HALTS_UNREADABLE`). Exits and cancels are never blocked by it. Nothing is
+latched: releasing a break lifts exactly that break's halt.
 
 **Every halt obligation has its own break, derived again in every run,
 whatever the run's soundness** (a run whose order reads are unusable, or a
@@ -581,7 +589,8 @@ returns at once, with no run.
   transaction of that fill (its principal and its fee), each linked to the
   transaction it reverses (`reversesLedgerTransactionId`: `Ledger.append`
   accepts only an exact negation). A correction that names neither the
-  fill nor one of its transactions does not discharge it. A release does not
+  fill nor one of its transactions does not discharge it. A release lifts
+  that break's entry halt at once, and no other (section 4). It does not
   resume trading: it queues a `MANUAL_REQUEST` run, which must pass on its
   own. Released history is acknowledged: the same order, trade, booking or
   alert does not reopen it, but new activity opens a new break. A released
@@ -598,8 +607,10 @@ returns at once, with no run.
   run must find the two equal. Each contradiction is offered to the OMS once
   per process, so its own halting alert (an `OMS_HALTING_ALERT` quarantine)
   is raised once.
-- **Before releasing an UNATTRIBUTED break,** make sure the incident
-  controller holds the market halt. Then decide what the activity was. A live
+- **Before releasing an UNATTRIBUTED break,** decide what the activity was:
+  the release lifts that market's entry halt at once (section 4). A market
+  that must stay halted needs a `MARKET` kill switch, engaged before the
+  release. A live
   unattributed order is cancelled with the emergency CLI (`WP-330`), not here.
 - **A held attempt** (the 425 path) waits for the composition's decision:
   resend the same signed order, or abandon it. Trading may resume meanwhile,

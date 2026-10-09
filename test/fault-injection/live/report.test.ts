@@ -102,7 +102,8 @@ describe("WP-340 r1: the security and recovery report", () => {
       ["Release-driver pins (r1)", "release-driver.test.ts", F1_RELEASES.releaseDriver],
     ];
     for (const [label, file, count] of rows) expect(findings, label).toContain(`| ${label} | \`${file}\` | ${String(count)} |`);
-    expect(F1_RELEASES_R0_SUITES, "the round-1 verifiers measured 284 on the r0 suites").toBe(284);
+    // The round-1 verifiers measured 284 on the r0 suites; C1-OMS06 removed the halt port's calls, 13 fewer (`support/expected-releases.ts`).
+    expect(F1_RELEASES_R0_SUITES, "284 on the r0 suites, less C1-OMS06's 13").toBe(271);
     expect(findings).toContain(`| **The r0 suites** | | **${String(F1_RELEASES_R0_SUITES)}** |`);
     expect(findings).toContain(`| **Total** | | **${String(F1_RELEASES_R0_SUITES + F1_RELEASES.releaseDriver)}** |`);
   });

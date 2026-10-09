@@ -807,6 +807,23 @@ export class ReconciliationCoordinator {
     return { ok: true, value: true };
   }
 
+  /**
+   * The journal's QUARANTINED breaks: what the live entry gate halts new entries on (C1-OMS06; WP-320's
+   * `reconciliationHalts`: a MARKET-scope break with a market halts that market, any other the account). It is read
+   * from the journal at every call, so an operator's {@link releaseQuarantine} lifts exactly that break's halt.
+   * A break still OPEN (any rule) is not in it: the OMS stays paused while any break is unresolved, and a run repairs
+   * an OPEN quarantine first.
+   *
+   * @throws when the journal's unresolved breaks cannot be read: never an empty list in their place (fail closed: the
+   * gate refuses an entry it cannot judge, `HALTS_UNREADABLE`). `status().unresolvedBreaks` is NOT a substitute: it
+   * reads an unreadable journal as no breaks.
+   */
+  quarantinedBreaks(): readonly JournalBreakView[] {
+    const unresolved = this.#unresolvedBreaks();
+    if (unresolved === undefined) throw new Error("the journal's unresolved breaks could not be read");
+    return Object.freeze(unresolved.filter((view) => view.status === "QUARANTINED"));
+  }
+
   status(): CoordinatorStatus {
     return Object.freeze({
       holding: this.#holding,
@@ -2862,8 +2879,8 @@ export class ReconciliationCoordinator {
     if (readable === undefined) run.journalOk = false;
     const unresolvedBefore = readable ?? [];
     // Repair first: a quarantine a crash left OPEN (between its BREAK_OPENED and its BREAK_QUARANTINED) is
-    // quarantined now, whether or not this run finds its subject again, and before the halts are delivered: an OPEN
-    // quarantine is never halted, never cleared by a run (its rule is a release), and cannot be released.
+    // quarantined now, whether or not this run finds its subject again: an OPEN quarantine does not halt entries
+    // (`quarantinedBreaks`), is never cleared by a run (its rule is a release), and cannot be released.
     for (const view of unresolvedBefore) {
       if (view.status !== "OPEN" || (view.rule !== "QUARANTINE_UNTIL_RELEASED" && view.rule !== "UNATTRIBUTED_HALT")) continue;
       const repaired = await this.#append({ kind: "BREAK_QUARANTINED", breakId: view.breakId, runId, resolutionLedgerTransactionId: null, atMs });
@@ -2882,8 +2899,14 @@ export class ReconciliationCoordinator {
       }
     };
     await recordPending();
-    // Halts for every quarantine (idempotent; re-delivered every run). A halt that fails is a detection, recorded.
-    this.#deliverHalts(run);
+    // The journal's unresolved breaks unreadable now: recorded. (The live gate's halts read them: `quarantinedBreaks`.)
+    if (this.#unresolvedBreaks() === undefined) {
+      this.#detect(run, {
+        breakClass: "COMPONENT_UNAVAILABLE",
+        subjectKey: compositeKey("COMPONENT_UNAVAILABLE", "journal"),
+        detail: "the journal's unresolved breaks could not be read",
+      });
+    }
     await recordPending();
     // Clear what this run positively judged consistent (a quarantine never: its rule is a release), each through the
     // one resolution function, which checks the latch after every await before it.
@@ -3101,58 +3124,6 @@ export class ReconciliationCoordinator {
       }
     }
     return undefined;
-  }
-
-  /** Deliver the halt of every quarantined break; a failure is itself a break. */
-  #deliverHalts(run: RunState): Detection[] {
-    const out: Detection[] = [];
-    const unresolved = this.#unresolvedBreaks();
-    if (unresolved === undefined) {
-      out.push(
-        detection({
-          breakClass: "COMPONENT_UNAVAILABLE",
-          subjectKey: compositeKey("COMPONENT_UNAVAILABLE", "journal"),
-          detail: "the journal's unresolved breaks could not be read: no halt could be delivered",
-        }),
-      );
-    }
-    const delivered = new Set<string>();
-    for (const view of unresolved ?? []) {
-      if (view.status !== "QUARANTINED") continue;
-      try {
-        if (view.scope === "MARKET" && view.marketId !== null) {
-          this.#deps.halts.haltMarket({ marketId: view.marketId, breakId: view.breakId, breakClass: view.breakClass, detail: view.detail });
-        } else {
-          this.#deps.halts.haltAccount({ breakId: view.breakId, breakClass: view.breakClass, detail: view.detail });
-        }
-        delivered.add(view.breakId);
-      } catch {
-        out.push(
-          detection({
-            breakClass: "HALT_DELIVERY_FAILED",
-            subjectKey: compositeKey("HALT_DELIVERY_FAILED", view.breakId),
-            detail: `the halt of break ${view.breakId} (${view.breakClass}) could not be delivered`,
-          }),
-        );
-      }
-    }
-    // A failed halt delivery is positively judged once that very halt was delivered, or its break is no longer
-    // quarantined (nothing is owed to deliver).
-    if (unresolved !== undefined) {
-      const quarantined = new Set(unresolved.filter((view) => view.status === "QUARANTINED").map((view) => view.breakId));
-      for (const view of unresolved) {
-        if (view.breakClass !== "HALT_DELIVERY_FAILED") continue;
-        const parts = decodeCompositeKey(view.subjectKey);
-        const target = parts?.length === 2 ? parts[1] : undefined;
-        if (target !== undefined && (delivered.has(target) || !quarantined.has(target))) run.positive.add(view.subjectKey);
-      }
-    }
-    const fresh = out.filter((entry) => !run.subjects.has(entry.subjectKey));
-    for (const entry of fresh) {
-      run.subjects.add(entry.subjectKey);
-      run.detections.push(entry);
-    }
-    return fresh;
   }
 
   /**
@@ -4272,9 +4243,9 @@ function readWalletRequest(raw: unknown): WalletReconciliationRequest | undefine
 }
 
 function checkDependencies(deps: unknown): string | undefined {
-  const fields = readFields(deps, ["reads", "journal", "holdings", "halts", "clock", "newId", "marketOfToken", "tokenOfGroup", "policy"]);
+  const fields = readFields(deps, ["reads", "journal", "holdings", "clock", "newId", "marketOfToken", "tokenOfGroup", "policy"]);
   if (fields === undefined) return "the dependencies must be own data";
-  for (const key of ["reads", "journal", "holdings", "halts", "clock"] as const) {
+  for (const key of ["reads", "journal", "holdings", "clock"] as const) {
     if (fields[key] === null || typeof fields[key] !== "object") return `${key} is required`;
   }
   for (const key of ["newId", "marketOfToken", "tokenOfGroup"] as const) if (typeof fields[key] !== "function") return `${key} must be a function`;

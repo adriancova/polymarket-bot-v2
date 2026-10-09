@@ -14,7 +14,7 @@
  * | an explicit heartbeat stop (§9.9 "Stop heartbeat", `ops-cli stop-heartbeat`, a fencing conflict) | blocked | blocked |
  * | the heartbeat lapsed, or the D6 recovery has not lifted the block | blocked | — |
  * | venue eligibility not established (`eligibility.ts`) | blocked | — |
- * | a reconciliation halt routed from WP-290's coordinator (account, or the request's market) | blocked | — |
+ * | a QUARANTINED break in WP-290's reconciliation journal (account, or the request's market), read at every ask; the journal unreadable | blocked | — |
  *
  * The SAME question is asked twice for every order: at decision time, by the
  * composition, and again at the final placement boundary — before every

@@ -12,7 +12,6 @@
  * | `ReconciledOms` | {@link ReadOnlyOmsView}: no tracked orders, no attempts (this CLI holds no trader memory) | `resume()` is refused (`OMS_RESUME_BLOCKED`); every write is refused and counted |
  * | journal | a `ReconciliationJournal` over an in-memory sink, opened empty | nothing reaches the trader's journal or `ops.reconciliation_*` |
  * | holdings | the durable ledger projection, read only, when one is configured | `bookUnattributed` is refused and counted |
- * | halts | a recorder | every halt the coordinator asks for is printed, none is delivered |
  *
  * `releaseQuarantine` is never called. Because the view holds no trader
  * memory, every order the venue lists is UNATTRIBUTED by construction: this
@@ -24,7 +23,6 @@ import { ReconciliationJournal, type ReconciliationJournalEvent } from "@polymar
 import {
   ReconciliationCoordinator,
   type AttemptView,
-  type HaltRequest,
   type HoldingsPort,
   type OmsAlert,
   type OmsRefusalCode,
@@ -140,7 +138,7 @@ export async function runReconcile(context: CommandContext, session: VenueSessio
     "run WP-290's ReconciliationCoordinator once (triggers STARTUP and MANUAL_REQUEST), reading venue truth with the emergency credential",
     `reads: /data/orders, /data/orders by id, /data/trades, /v2/positions, /v2/approvals (each at ${READ_PRIORITY}), and the on-chain collateral balance`,
     `against: no trader memory (a read-only, empty OMS view: every venue order is unattributed by construction) and ${projection === null ? "NO ledger projection (none is configured: the holdings comparison holds as unread)" : "the durable ledger projection, read only"}`,
-    "read-only: nothing is resumed (the view refuses), no quarantine is released, nothing is booked (refused), no halt is delivered (recorded), and the journal is in memory only (nothing reaches the trader's)",
+    "read-only: nothing is resumed (the view refuses), no quarantine is released, nothing is booked (refused), and the journal is in memory only (nothing reaches the trader's)",
   ]);
   if (policy === null) {
     printer.section(SECTIONS.RESULT, ["nothing was run: the ops configuration has no reconciliation policy (it has no default)"]);
@@ -164,24 +162,15 @@ export async function runReconcile(context: CommandContext, session: VenueSessio
     printer.section(SECTIONS.UNKNOWN, ["the account's reconciliation state"]);
     return { exit: "INTERNAL_ERROR", result: { ran: false } };
   }
-  const halts: (HaltRequest & { readonly marketId: string | null })[] = [];
   const refusedBookings: string[] = [];
   const oms = new ReadOnlyOmsView();
   const coordinator = new ReconciliationCoordinator({
     reads: session.reads,
     journal: journal.value,
     holdings: readOnlyHoldings(projection, refusedBookings),
-    halts: {
-      haltMarket: (request) => {
-        halts.push(Object.freeze({ ...request }));
-      },
-      haltAccount: (request) => {
-        halts.push(Object.freeze({ ...request, marketId: null }));
-      },
-    },
     clock: { now: () => context.clock.nowMs() },
     newId: context.newId,
-    // No catalog is consulted: an unknown market halts the account (recorded only).
+    // No catalog is consulted: an unknown market's break is the account's (reported only).
     marketOfToken: () => null,
     // The view registers no execution group.
     tokenOfGroup: () => null,
@@ -212,7 +201,6 @@ export async function runReconcile(context: CommandContext, session: VenueSessio
       : `resumed: no${oms.resumeRefusals > 0 ? ` (the coordinator asked ${String(oms.resumeRefusals)} time(s); the read-only view refused)` : ""}`,
   );
   result.push(`quarantines released: none (never called)`);
-  for (const halt of halts) result.push(`halt requested, NOT delivered: ${halt.marketId === null ? "account" : `market ${halt.marketId}`} for ${halt.breakClass} (${halt.detail})`);
   for (const booking of refusedBookings) result.push(`UNATTRIBUTED booking refused (read-only): ${booking}`);
   if (oms.refusedWrites.length > 0) result.push(`OMS writes refused (read-only): ${oms.refusedWrites.join(", ")}`);
   for (const record of session.readLog) if (!record.sent) result.push(`${record.read} was NOT SENT: ${record.note ?? "not granted"}`);
@@ -235,7 +223,6 @@ export async function runReconcile(context: CommandContext, session: VenueSessio
       runs: report.runs.map((run) => ({ runId: run.runId, status: runs.find((view) => view.runId === run.runId)?.status ?? run.status, resumed: run.resumed })),
       breaks,
       breakCount: detected.length,
-      haltsRequested: halts.length,
       bookingsRefused: refusedBookings.length,
       journalEvents: events.length,
       resumed: report.resumed,

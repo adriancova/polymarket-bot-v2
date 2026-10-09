@@ -18,7 +18,7 @@ import { describe, expect, it } from "vitest";
 import { compositeKey } from "../../../packages/oms/src/guards.js";
 import type { OrderManager } from "../../../packages/oms/src/index.js";
 
-import { MARKET, YES, boot, streamTrade } from "./support/harness.js";
+import { MARKET, YES, boot, halted, streamTrade } from "./support/harness.js";
 import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
 async function restart(r: Ready): Promise<Ready> {
@@ -140,7 +140,7 @@ describe("WP-290 r4 (WP290-CX-R4-01): the ids an unusable open-orders answer car
     const quarantined = again.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED");
     expect(quarantined).toMatchObject({ status: "QUARANTINED", marketId: MARKET });
     expect(quarantined?.detail).toContain(foreign);
-    expect(r.u.halts.some((halt) => halt.breakId === quarantined?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(again.p).some((halt) => halt.breakId === quarantined?.breakId && halt.marketId === MARKET)).toBe(true);
     // The SHOWN record was judged (its by-id read found it) and is cleared; the order is classified now.
     expect(unresolvedSubjects(again)).not.toContain(shown(foreign));
     expect(await reconcileRounds(again, 2)).toBe(false);
@@ -331,7 +331,7 @@ describe("WP-290 r4 (WP290-V4-GHOST-ID-PERMANENT-HOLD): an id no read showed, wh
     const quarantine = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_NOT_FOUND_BY_ID");
     expect(quarantine).toMatchObject({ status: "QUARANTINED", scope: "ACCOUNT", subjectKey: compositeKey("ORDER_NOT_FOUND_BY_ID", "venue-ghost") });
     expect(quarantine?.detail).toContain("the venue's by-id read does not find it");
-    expect(r.u.halts.some((halt) => halt.breakId === quarantine?.breakId && halt.marketId === null)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === quarantine?.breakId && halt.marketId === null)).toBe(true);
     expect(unresolvedSubjects(r)).not.toContain(named("venue-ghost"));
     // Every quarantine released (the OMS's own alert too, where its process still has it): the account resumes.
     // (r5) While the not-found quarantine stands no attempt is answered by signed identity, so the attempt is answered

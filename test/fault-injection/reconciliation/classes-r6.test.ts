@@ -22,7 +22,7 @@ import type { OmsAlert, ReconciliationJournalPort } from "../../../packages/oms/
 import { group, ticket } from "../../unit/oms/support/harness.js";
 import { uuid7 } from "../../unit/oms/support/ids.js";
 
-import { ACCOUNT, MARKET, MARKET_NO, NO, YES, streamTrade } from "./support/harness.js";
+import { ACCOUNT, MARKET, MARKET_NO, NO, YES, halted, streamTrade } from "./support/harness.js";
 import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
 function oracle(r: Ready): string[] {
@@ -301,7 +301,7 @@ describe("WP-290 r6 class C: every halt obligation has its own durable identity,
     expect(first?.detections.map((detection) => detection.breakClass)).toEqual(expect.arrayContaining(["READ_STALE", "OMS_HALTING_ALERT"]));
     const quarantine = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "OMS_HALTING_ALERT");
     expect(quarantine?.status).toBe("QUARANTINED");
-    expect(r.u.halts.some((halt) => halt.marketId === MARKET && halt.breakId === quarantine?.breakId)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.marketId === MARKET && halt.breakId === quarantine?.breakId)).toBe(true);
     expect(oracle(r)).toEqual([]);
   });
 
@@ -335,7 +335,7 @@ describe("WP-290 r6 class C: every halt obligation has its own durable identity,
     expect(first?.resumed).toBe(false);
     const quarantine = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "OMS_HALTING_ALERT");
     expect(quarantine?.status).toBe("QUARANTINED");
-    expect(r.u.halts.some((halt) => halt.marketId === MARKET && halt.breakId === quarantine?.breakId)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.marketId === MARKET && halt.breakId === quarantine?.breakId)).toBe(true);
     expect(oracle(r)).toEqual([]);
   });
 
@@ -353,7 +353,7 @@ describe("WP-290 r6 class C: every halt obligation has its own durable identity,
       ["QUARANTINED", MARKET_NO],
     ]);
     expect(arrivals.every((view) => view.detail.includes(id))).toBe(true);
-    expect(new Set(r.u.halts.map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
+    expect(new Set(halted(r.p).map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
   });
 
   it("(C, a FAILED settlement) recorded and its market halted by a run whose open-orders read is unusable", async () => {
@@ -367,7 +367,7 @@ describe("WP-290 r6 class C: every halt obligation has its own durable identity,
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "SETTLEMENT_FAILED");
     const failed = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "SETTLEMENT_FAILED");
     expect(failed?.subjectKey).toBe(compositeKey("SETTLEMENT_FAILED", trade?.venueTradeId ?? "", trade?.venueOrderId ?? ""));
-    expect(r.u.halts.some((halt) => halt.breakId === failed?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === failed?.breakId && halt.marketId === MARKET)).toBe(true);
   });
 
   it("(C, occurrences) a not-found quarantine released, then the id named again by new evidence and still not found: a NEW occurrence, its own quarantine, and signed-identity answers withheld again", async () => {

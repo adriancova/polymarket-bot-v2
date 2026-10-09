@@ -6,7 +6,7 @@
 
 import {it,expect} from 'vitest';
 import {ready,submitOne,reconcileRounds} from '../support/scenario.js';
-import {boot,ACCOUNT,YES,NO,MARKET,MARKET_NO} from '../support/harness.js';
+import {boot,halted,ACCOUNT,YES,NO,MARKET,MARKET_NO} from '../support/harness.js';
 import {projectLedger,projectedHoldings} from '../../../../packages/ledger/src/index.js';
 import { trace, type Loose } from "../support/loose.js";
 
@@ -52,9 +52,9 @@ it('R3-C every asset and market arrival of one transaction needs its own halt',a
  r.u.world.adjustPosition(YES,'3');r.u.world.adjustPosition(NO,'3');
  const arrivals=projectedHoldings(projectLedger(r.u.ledger),ACCOUNT).unattributedArrivals;
  expect(arrivals).toHaveLength(2);
- await r.p.coordinator.reconcile();const breaks=r.p.journal.unresolvedBreaks();
+ await r.p.coordinator.reconcile();const breaks=r.p.journal.unresolvedBreaks();const halts=halted(r.p);
  for(const b of breaks)await r.p.coordinator.releaseQuarantine({breakId:b.breakId,operatorRef:'operator',reason:'acknowledge only the arrival named by this break'});
  const result=await r.p.coordinator.reconcile();
- trace('R3-C',JSON.stringify({arrivals,breaks,halts:r.u.halts,result}));
- expect(new Set(r.u.halts.map(x=>x.marketId))).toEqual(new Set([MARKET,MARKET_NO]));
+ trace('R3-C',JSON.stringify({arrivals,breaks,halts,result}));
+ expect(new Set(halts.map(x=>x.marketId))).toEqual(new Set([MARKET,MARKET_NO]));
 });

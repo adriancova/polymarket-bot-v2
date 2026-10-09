@@ -6,7 +6,7 @@
 
 import { expect, it } from 'vitest';
 import { ready, submitOne, reconcileRounds, sequence, type Ready } from '../support/scenario.js';
-import { boot, bookReversal } from '../support/harness.js';
+import { boot, bookReversal, halted } from '../support/harness.js';
 import { trace, type Loose } from "../support/loose.js";
 
 async function releaseAll(r: Ready) {
@@ -36,17 +36,17 @@ it('V4-XPF second FAILED trade on the same order after every quarantine of the f
   await releaseAll(r);
   bookReversal(r.u, t1.venueTradeId, t1.venueOrderId);
   expect(await reconcileRounds(r, 4)).toBe(true);
-  const haltsBefore = r.u.halts.length;
+  const haltsBefore = halted(r.p).length;
   r.u.world.failTrade(t2);
   r.p.coordinator.trigger('PERIODIC_TIMER');
   const b = await r.p.coordinator.reconcile();
   const sf = r.p.journal.unresolvedBreaks().filter((v) => v.breakClass === 'SETTLEMENT_FAILED');
-  trace('V4-XPF', JSON.stringify({ runA: a.runs.map((x) => [x.status, x.resumed]), firstClasses, afterAlertOnly, runB: b.runs.map((x) => [x.status, x.resumed, x.detections.map((d) => d.breakClass)]), sf: sf.map((v) => [v.subjectKey, v.status, v.marketId]), newHalts: r.u.halts.length - haltsBefore, paused: r.oms.paused, violations: [...r.u.violations, ...r.u.world.violations] }));
+  trace('V4-XPF', JSON.stringify({ runA: a.runs.map((x) => [x.status, x.resumed]), firstClasses, afterAlertOnly, runB: b.runs.map((x) => [x.status, x.resumed, x.detections.map((d) => d.breakClass)]), sf: sf.map((v) => [v.subjectKey, v.status, v.marketId]), newHalts: halted(r.p).length - haltsBefore, paused: r.oms.paused, violations: [...r.u.violations, ...r.u.world.violations] }));
   expect(afterAlertOnly).toBe(false);
   expect(b.resumed).toBe(false);
   expect(sf.length).toBe(1);
   expect(sf[0]!.subjectKey).toContain(t2.venueTradeId);
-  expect(r.u.halts.length - haltsBefore).toBeGreaterThan(0);
+  expect(halted(r.p).length - haltsBefore).toBeGreaterThan(0);
 });
 
 // After a restart, a released FAILED trade is acknowledged, a NEW FAILED trade on the same order is not.
@@ -99,7 +99,7 @@ it('V4-A1-UNSOUND crash after durable FAILED; restart with the trades read faili
   r.u.world.faults = {};
   const later = await reconcileRounds(again, 3);
   const sf = p.journal.unresolvedBreaks().filter((v) => v.breakClass === 'SETTLEMENT_FAILED');
-  trace('V4-A1-UNSOUND', JSON.stringify({ early, later, sf: sf.map((v) => [v.status, v.marketId]), halts: r.u.halts.filter((h) => h.breakId === sf[0]?.breakId).length }));
+  trace('V4-A1-UNSOUND', JSON.stringify({ early, later, sf: sf.map((v) => [v.status, v.marketId]), halts: halted(p).filter((h) => h.breakId === sf[0]?.breakId).length }));
   expect(early).toBe(false); expect(later).toBe(false);
   expect(sf.length).toBe(1); expect(sf[0]!.status).toBe('QUARANTINED');
 });

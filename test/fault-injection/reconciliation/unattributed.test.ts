@@ -24,7 +24,7 @@ import { describe, expect, it } from "vitest";
 
 import { projectLedger, projectedHoldings } from "../../../packages/ledger/src/index.js";
 
-import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, boot, ledgerHoldings, reconcileUntilResumed, universe, type KillPlan, type Process, type Universe } from "./support/harness.js";
+import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, boot, halted, ledgerHoldings, reconcileUntilResumed, universe, type KillPlan, type Process, type Universe } from "./support/harness.js";
 import { expectPaused, ready, reconcileRounds, submitOne, type Ready } from "./support/scenario.js";
 
 function corrections(ledger: Parameters<typeof projectLedger>[0]): { readonly id: string; readonly eventType: string; readonly entries: readonly { readonly scope: string; readonly assetId: string; readonly amount: string }[] }[] {
@@ -44,7 +44,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     const quarantined = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED");
     expect(quarantined).toMatchObject({ status: "QUARANTINED", rule: "UNATTRIBUTED_HALT", scope: "MARKET", marketId: MARKET, assetId: YES });
     expect(quarantined?.detail).toContain(foreign.venueOrderId);
-    expect(r.u.halts.some((halt) => halt.marketId === MARKET && halt.breakId === quarantined?.breakId)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.marketId === MARKET && halt.breakId === quarantined?.breakId)).toBe(true);
     // Released by an operator: acknowledged, not reopened by the same order; the next run must pass on its own.
     const released = await r.p.coordinator.releaseQuarantine({ breakId: quarantined?.breakId ?? "", operatorRef: "operator-1", reason: "manual order, known" });
     expect(released.ok).toBe(true);
@@ -66,7 +66,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     const view = r.p.journal.unresolvedBreaks().find((entry) => entry.breakClass === "TRADE_UNATTRIBUTED");
     expect(view).toMatchObject({ status: "QUARANTINED", scope: "MARKET", marketId: MARKET, observedValue: "1" });
     expect(view?.detail).toContain(trade?.venueTradeId ?? "?");
-    expect(r.u.halts.some((halt) => halt.breakId === view?.breakId)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === view?.breakId)).toBe(true);
     // Nothing is attributed to a strategy: the OMS recorded no fill for it.
     expect(r.oms.orders().every((order) => order.filledShares === "0")).toBe(true);
   });
@@ -89,7 +89,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     expect(arrivals).toEqual([expect.objectContaining({ activityKind: "ACTUAL_ARRIVAL", haltRequired: true, assetId: YES, amount: "3", affectedMarketId: MARKET })]);
     const view = r.p.journal.unresolvedBreaks().find((entry) => entry.breakClass === "POSITION_UNATTRIBUTED");
     expect(view).toMatchObject({ status: "QUARANTINED", marketId: MARKET, resolutionLedgerTransactionId: booked[0]?.id });
-    expect(r.u.halts.some((halt) => halt.marketId === MARKET)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.marketId === MARKET)).toBe(true);
     expect(ledgerHoldings(r.u).get(YES)).toBe("3");
     // Released: the projection now explains the holding, and the booked arrival is acknowledged.
     await r.p.coordinator.releaseQuarantine({ breakId: view?.breakId ?? "", operatorRef: "operator-1", reason: "tokens received from a known transfer" });
@@ -124,7 +124,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     await expectPaused(r, report.resumed, "BALANCE_UNATTRIBUTED");
     const view = r.p.journal.unresolvedBreaks().find((entry) => entry.breakClass === "BALANCE_UNATTRIBUTED");
     expect(view).toMatchObject({ status: "QUARANTINED", scope: "ACCOUNT", marketId: null, assetId: PUSD });
-    expect(r.u.halts.some((halt) => halt.breakId === view?.breakId && halt.marketId === null)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === view?.breakId && halt.marketId === null)).toBe(true);
     expect(projectLedger(r.u.ledger).unattributedActivity).toEqual([expect.objectContaining({ assetId: PUSD, amount: "25", haltRequired: true })]);
   });
 
@@ -157,7 +157,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     const report = await r.p.coordinator.reconcile();
     await expectPaused(r, report.resumed, "FILL_ECONOMICS_UNFIXED");
     expect(corrections(r.u.ledger)).toEqual([]);
-    expect(r.u.halts).toEqual([]);
+    expect(halted(r.p)).toEqual([]);
   });
 
   it("(I-10) a confirmed delta the ledger refuses to book: CORRECTION_FAILED, held; booked by a later run once the ledger takes it", async () => {
@@ -177,21 +177,6 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     const booked = await r.p.coordinator.reconcile();
     await expectPaused(r, booked.resumed, "POSITION_UNATTRIBUTED");
     expect(corrections(r.u.ledger)).toHaveLength(1);
-  });
-
-  it("(I-10) a halt the halt port cannot take: HALT_DELIVERY_FAILED, held; delivered again by every run", async () => {
-    const r = await ready();
-    r.u.seams.haltsFail = true;
-    r.u.world.placeForeign({ tokenId: YES, side: "BUY", price: "0.3", size: "2" });
-    r.p.coordinator.trigger("PERIODIC_TIMER");
-    const report = await r.p.coordinator.reconcile();
-    await expectPaused(r, report.resumed, "HALT_DELIVERY_FAILED");
-    expect(r.u.halts).toEqual([]);
-    delete r.u.seams.haltsFail;
-    r.p.coordinator.trigger("PERIODIC_TIMER");
-    await r.p.coordinator.reconcile();
-    const quarantined = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED");
-    expect(r.u.halts.some((halt) => halt.breakId === quarantined?.breakId)).toBe(true);
   });
 
   it("a delta that changes before it is confirmed is not booked; one that disappears clears", async () => {
@@ -240,7 +225,7 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     const recovered = second.journal.unresolvedBreaks().find((view) => view.breakClass === "LEDGER_UNATTRIBUTED_ARRIVAL");
     expect(recovered).toMatchObject({ status: "QUARANTINED", scope: "MARKET", marketId: MARKET, assetId: YES });
     expect(second.oms?.paused).toBe(true);
-    expect(u.halts.some((halt) => halt.breakId === recovered?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(second).some((halt) => halt.breakId === recovered?.breakId && halt.marketId === MARKET)).toBe(true);
     // Never booked twice: the holding now matches the projection, so nothing more is owed.
     await second.coordinator.reconcile();
     u.clock.t += u.policy.holdingConfirmationMs;
@@ -291,7 +276,7 @@ describe("WP-290 acceptance 2 (r3, D-A3): every halt obligation of one ledger tr
       ["QUARANTINED", "MARKET", MARKET_NO, NO],
     ]);
     expect(breaks.every((view) => view.detail.includes(id))).toBe(true);
-    expect(new Set(r.u.halts.map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
+    expect(new Set(halted(r.p).map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
     // The operator releases market A's arrival only: market B's still holds, and is still halted.
     const [first, second] = breaks;
     await release(r, first?.breakId);
@@ -300,10 +285,9 @@ describe("WP-290 acceptance 2 (r3, D-A3): every halt obligation of one ledger tr
     // A restart: the released arrival is acknowledged (not opened again); the other still holds, halted again.
     const p = await boot(r.u);
     const again: Ready = { u: r.u, p, oms: p.oms as Ready["oms"] };
-    const haltsBefore = r.u.halts.length;
     expect(await reconcileRounds(again, 2)).toBe(false);
     expect(again.p.journal.unresolvedBreaks().map((view) => view.breakId)).toEqual([second?.breakId]);
-    expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === second?.breakId && halt.marketId === MARKET_NO)).toBe(true);
+    expect(halted(again.p).some((halt) => halt.breakId === second?.breakId && halt.marketId === MARKET_NO)).toBe(true);
     await release(again, second?.breakId);
     expect(await reconcileRounds(again, 2)).toBe(true);
     // Nothing was booked: the obligations were the ledger's own.
@@ -330,7 +314,7 @@ describe("WP-290 acceptance 2 (r3, D-A3): every halt obligation of one ledger tr
       [MARKET, PUSD],
       [MARKET_NO, PUSD],
     ]);
-    expect(new Set(r.u.halts.map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
+    expect(new Set(halted(r.p).map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
   });
 
   it("(D-A3) two obligations equal in transaction, kind, asset and market are two breaks (each its own place)", async () => {
@@ -378,10 +362,10 @@ describe("WP-290 acceptance 2 (r3, D-A3): every halt obligation of one ledger tr
     const second = await boot(u);
     const view = (): ReturnType<Process["journal"]["unresolvedBreaks"]>[number] | undefined => second.journal.unresolvedBreaks().find((entry) => entry.breakClass === "ORDER_UNATTRIBUTED");
     expect(view()?.status).toBe("OPEN");
-    expect(u.halts).toEqual([]);
+    expect(halted(second)).toEqual([]); // an OPEN quarantine does not halt entries
     const report = await second.coordinator.reconcile();
     expect(report.resumed).toBe(false);
     expect(view()?.status).toBe("QUARANTINED");
-    expect(u.halts.some((halt) => halt.breakId === view()?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(second).some((halt) => halt.breakId === view()?.breakId && halt.marketId === MARKET)).toBe(true);
   });
 });

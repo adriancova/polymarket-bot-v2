@@ -6,7 +6,7 @@
 
 import { expect, it } from 'vitest';
 import { ready, submitOne, reconcileRounds, type Ready } from '../support/scenario.js';
-import { YES } from '../support/harness.js';
+import { YES, halted } from '../support/harness.js';
 import { trace, type Loose } from "../support/loose.js";
 
 const ev = (r: Ready) => r.p.journal.events() as Loose[];
@@ -84,12 +84,12 @@ it('N1-F a foreign order seen in run 1 (its by-id read failed), canceled before 
   const reads: string[] = [];
   r.u.world.faults = { readOrder: (id, answer) => { reads.push(id); return answer(); } };
   const resumed = await reconcileRounds(r, 4);
-  trace('N1-F', JSON.stringify({ run1: run1.runs.map((x: Loose) => [x.status, x.detections.map((d: Loose) => d.breakClass)]), resumed, reads, opened: opened(r), resolutions: resolutionsAll(r), halts: r.u.halts.length }));
+  trace('N1-F', JSON.stringify({ run1: run1.runs.map((x: Loose) => [x.status, x.detections.map((d: Loose) => d.breakClass)]), resumed, reads, opened: opened(r), resolutions: resolutionsAll(r), halts: halted(r.p).length }));
 });
 it('N1-F-ctl control: the same foreign order in a sound run 1', async () => {
   const r = await ready();
   const x = r.u.world.placeForeign({ tokenId: YES, side: 'BUY', price: '0.3', size: '2' });
   r.p.coordinator.trigger('PERIODIC_TIMER');
   const run1 = await r.p.coordinator.reconcile();
-  trace('N1-F-ctl', JSON.stringify({ run1: run1.runs.map((x: Loose) => [x.status, x.detections.map((d: Loose) => d.breakClass)]), opened: opened(r), halts: r.u.halts.length, xid: x.venueOrderId }));
+  trace('N1-F-ctl', JSON.stringify({ run1: run1.runs.map((x: Loose) => [x.status, x.detections.map((d: Loose) => d.breakClass)]), opened: opened(r), halts: halted(r.p).length, xid: x.venueOrderId }));
 });

@@ -23,7 +23,6 @@ import {
 } from "../../../apps/trader/src/live-safety/index.js";
 import type {
   CancelOutcome,
-  HaltPort,
   LimitOrderRequest,
   OmsReservationPort,
   OmsStore,
@@ -64,10 +63,6 @@ export function safetyGateIsTheControllersGate(safety: LiveSafety): HeartbeatGat
 
 export function safetySinkIsTheControllersSink(safety: LiveSafety): HeartbeatIdSink {
   return safety.heartbeatIdSink;
-}
-
-export function safetyHaltsAreWp290sHaltPort(safety: LiveSafety): HaltPort {
-  return safety.halts;
 }
 
 export function fencedVenueIsAnOmsVenuePort(

@@ -36,7 +36,6 @@ import {
   OrderManager,
   ReconciliationCoordinator,
   type AttemptView,
-  type HaltRequest,
   type OmsAlert,
   type OmsReservationPort,
   type OmsStore,
@@ -94,7 +93,6 @@ export interface Universe {
   readonly coordinatorIds: () => string;
   readonly requestToken: () => string;
   readonly mode: { value: VenueMode };
-  readonly halts: (HaltRequest & { readonly marketId: string | null })[];
   readonly omsRequests: ReconciliationRequest[];
   readonly violations: string[];
   /** Accepted answers, for assertions. */
@@ -108,7 +106,7 @@ export interface Universe {
   /**
    * Test seams over the ports a process binds (all default to the real objects): the journal port the
    * coordinator sees (read at boot); the OMS's attempt list (e.g. an attempt reported in flight), its alert list,
-   * and its answer to a reconciliation; the group-token binding; a ledger that refuses bookings; a halt port that throws.
+   * and its answer to a reconciliation; the group-token binding; a ledger that refuses bookings.
    * Each is a structural answer a real port could give; none reaches a network or a key.
    */
   readonly seams: {
@@ -120,8 +118,6 @@ export interface Universe {
     tokenOfGroup?: (executionGroupId: string, real: (executionGroupId: string) => string | null) => string | null;
     /** The ledger refuses every UNATTRIBUTED booking. */
     refuseBooking?: boolean;
-    /** The halt port throws. */
-    haltsFail?: boolean;
     /** The ledger's answer about FAILED fills' remaining bookings (r4), e.g. one that omits a fill or throws. */
     remainingBookings?: (fills: readonly { readonly venueTradeId: string; readonly venueOrderId: string }[], real: () => unknown) => unknown;
     /**
@@ -175,7 +171,6 @@ export function universe(
     coordinatorIds: idSource(0x290),
     requestToken: options.requestToken ?? tokenSource("wp290"),
     mode: { value: "NORMAL" },
-    halts: [],
     omsRequests: [],
     violations: [],
     accepted: [],
@@ -236,6 +231,14 @@ export interface Process {
   readonly journal: ReconciliationJournal;
   /** `null` when the incarnation died while opening. */
   readonly oms: OrderManager | null;
+}
+
+/**
+ * The halts the live entry gate reads (C1-OMS06): the coordinator's QUARANTINED breaks (`quarantinedBreaks`, which
+ * throws when the journal cannot be read), each with its market, or `null` when it halts the account.
+ */
+export function halted(p: Process): { readonly breakId: string; readonly marketId: string | null }[] {
+  return p.coordinator.quarantinedBreaks().map((view) => ({ breakId: view.breakId, marketId: view.scope === "MARKET" ? view.marketId : null }));
 }
 
 /** Fold every durable OMS fill into the ledger once (the composition posts each fill at its match: ADR-006 §5). */
@@ -531,18 +534,6 @@ export async function boot(u: Universe, plan: KillPlan | null = null, options: {
           if (!appended.ok) return { ok: false };
           u.ledger = appended.value.ledger;
           return { ok: true };
-        }),
-    },
-    halts: {
-      haltMarket: (request) =>
-        inc.callSync("halt.market", () => {
-          if (u.seams.haltsFail === true) throw new Error("the incident controller is unreachable");
-          u.halts.push(request);
-        }),
-      haltAccount: (request) =>
-        inc.callSync("halt.account", () => {
-          if (u.seams.haltsFail === true) throw new Error("the incident controller is unreachable");
-          u.halts.push({ ...request, marketId: null });
         }),
     },
     clock: { now: () => (u.seams.localClock === undefined ? u.clock.t : u.seams.localClock(u.clock.t)) },
