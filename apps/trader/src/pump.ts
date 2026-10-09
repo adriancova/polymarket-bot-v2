@@ -24,8 +24,8 @@
  * - `RESYNC_REQUIRED` → `TRANSPORT_RESYNC_REQUIRED`. ADR-003 §3.3's hard
  *   resync: retention removed events this consumer never read. §7.1 requires a
  *   NEW AUTHORITATIVE SNAPSHOT before affected markets resume, so this is not
- *   something the pump may retry through — it stops, and recovery is an
- *   operator act with evidence (`HaltController.release`).
+ *   something the pump may retry through — it stops, and recovery is a new
+ *   run (`C1-HALTS`: every halt ends the run; nothing releases one).
  *
  * A halt is a LATCH, so `pump` returns rather than spinning: a process that
  * kept polling a halted transport would look alive while deciding nothing.

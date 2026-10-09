@@ -1,6 +1,6 @@
 /**
- * The halt controller — §4.2 failure boundaries, §9.9's ladder, and the
- * `WP-200` composition-root obligation.
+ * The halt controller — §4.2 failure boundaries and the `WP-200`
+ * composition-root obligation.
  *
  * The obligation `WP-200` round 2 left for whoever composed the process:
  *
@@ -31,34 +31,18 @@ describe("HaltController", () => {
     expect(halts.globalHalt()?.code).toBe("STORE_UNAVAILABLE");
   });
 
-  it("maps every reason code to a §9.9 ladder action", () => {
+  it("C1-HALTS: a record carries scope, code, detail and instant — and no §9.9 action rung", () => {
     const halts = new HaltController();
-    const cases = [
-      ["TRANSPORT_UNAVAILABLE", "FULL_HALT"],
-      ["TRANSPORT_RESYNC_REQUIRED", "FULL_HALT"],
-      ["STORE_UNAVAILABLE", "FULL_HALT"],
-      ["QUEUE_BACKPRESSURE", "FULL_HALT"],
-      ["UNATTRIBUTED_ACTIVITY", "RECONCILE_ACCOUNT"],
-      ["UNEXPLAINED_ACTUAL_MOVEMENT", "RECONCILE_ACCOUNT"],
-      ["LEDGER_POSTING_REFUSED", "FULL_HALT"],
-      ["ACCOUNTING_REBUILD_MISMATCH", "FULL_HALT"],
-      ["CANCEL_UNRESOLVED", "MANAGE_KNOWN_POSITIONS_ONLY"],
-      ["BASKET_PARTIALLY_EXECUTED", "MANAGE_KNOWN_POSITIONS_ONLY"],
-      ["VENUE_OBSERVATION_FAILED", "RECONCILE_ACCOUNT"],
-      ["RUNTIME_PERSISTENCE_FAILED", "FULL_HALT"],
-      ["EVENT_UNREADABLE", "FULL_HALT"],
-      ["BOOK_DESYNCHRONIZED", "CANCEL_RESTING_ORDERS"],
-      ["OPERATOR_HALT", "FULL_HALT"],
-    ] as const;
-    for (const [code, action] of cases) {
-      const record = halts.halt(
-        { kind: "STRATEGY_INSTANCE", instanceId: code },
-        code,
-        "reason",
-        AT,
-      );
-      expect(record.action, code).toBe(action);
-    }
+    const record = halts.halt({ kind: "MARKET", marketId: MARKET }, "CANCEL_UNRESOLVED", "reason", AT);
+    expect(Object.keys(record).sort()).toEqual(["at", "code", "detail", "scope"]);
+    expect(record.scope).toEqual({ kind: "MARKET", marketId: MARKET });
+  });
+
+  it("C1-HALTS: nothing releases a halt — the controller has no release seam", () => {
+    const halts = new HaltController();
+    halts.halt({ kind: "MARKET", marketId: MARKET }, "BOOK_DESYNCHRONIZED", "identity", AT);
+    expect("release" in halts).toBe(false);
+    expect(halts.anyHalt).toBe(true);
   });
 
   it("a GLOBAL halt halts every market and every instance", () => {
@@ -86,33 +70,6 @@ describe("HaltController", () => {
       "MARKET",
       "MARKET",
     ]);
-  });
-
-  it("release DEMANDS the authoritative-snapshot evidence and answers whether it did anything", () => {
-    const halts = new HaltController();
-    halts.halt({ kind: "GLOBAL" }, "TRANSPORT_RESYNC_REQUIRED", "gap", AT);
-    expect(
-      halts.release(
-        { kind: "GLOBAL" },
-        { authoritativeSnapshotApplied: false as unknown as true, reason: "please" },
-      ),
-    ).toBe(false);
-    expect(halts.anyHalt).toBe(true);
-    expect(
-      halts.release(
-        { kind: "GLOBAL" },
-        { authoritativeSnapshotApplied: true, reason: "re-snapshotted" },
-      ),
-    ).toBe(true);
-    expect(halts.anyHalt).toBe(false);
-    // Releasing a halt that never existed is `false`, so an acknowledgement
-    // cannot be mistaken for a recovery.
-    expect(
-      halts.release(
-        { kind: "GLOBAL" },
-        { authoritativeSnapshotApplied: true, reason: "again" },
-      ),
-    ).toBe(false);
   });
 });
 

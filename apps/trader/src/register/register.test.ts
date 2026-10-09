@@ -188,8 +188,9 @@ describe("the --help text says what the command does", () => {
     const documented = [...USAGE.matchAll(/--([a-z-]+)/gu)]
       .map((match) => match[1])
       .filter((flag) => flag !== "filter");
-    // `ROLLOVER-1`: `--series` is the one boolean flag (FLAGS is the market mode's argv).
-    const taken = [...FLAGS.filter((token) => token.startsWith("--")).map((token) => token.slice(2)), "series"];
+    // `ROLLOVER-1`: `--series` is the one boolean flag (FLAGS is the market mode's argv);
+    // `C1-HALTS`: `--new-run` takes an instance id.
+    const taken = [...FLAGS.filter((token) => token.startsWith("--")).map((token) => token.slice(2)), "series", "new-run"];
     for (const flag of taken) expect(documented, flag).toContain(flag);
     expect([...new Set(documented)].sort()).toEqual([...taken, "help"].sort());
   });
@@ -505,5 +506,41 @@ describe("readSeriesTemplate (ROLLOVER-1)", () => {
     };
     const read = readSeriesTemplate(JSON.stringify(unreviewed), SAFE_ENV, () => Date.UTC(2026, 9, 4));
     expect(read.ok ? "accepted" : read.refusal.code).toBe("REGISTER_TEMPLATE_INVALID");
+  });
+});
+
+describe("register --new-run <instanceId> (C1-HALTS, NEW-RUN)", () => {
+  const NEW_RUN_FLAGS = ["--new-run", "b18f4a7e-1111-7abc-8def-0123456789ab", "--template", "done.json", "--out", "next.json", "--code-commit", "abc123"];
+
+  it("parses its four flags, and requires each", () => {
+    const parsed = parseRegisterArguments(NEW_RUN_FLAGS);
+    expect(parsed.ok ? parsed.arguments : parsed.problems).toEqual({
+      newRun: "b18f4a7e-1111-7abc-8def-0123456789ab",
+      template: "done.json",
+      out: "next.json",
+      codeCommit: "abc123",
+    });
+    const missing = parseRegisterArguments(["--new-run", "x"]);
+    expect(missing.ok ? [] : missing.problems).toEqual(["--template is required", "--out is required", "--code-commit is required"]);
+  });
+
+  it("REFUSES every flag describing what it reuses, and --series, rather than ignoring them", () => {
+    for (const [flag, value] of [
+      ["--instance-name", "x"],
+      ["--created-by", "x"],
+      ["--question-title", "x"],
+      ["--neg-risk", "false"],
+      ["--lifecycle-state", "OPEN"],
+    ] as const) {
+      const parsed = parseRegisterArguments([...NEW_RUN_FLAGS, flag, value]);
+      expect(parsed.ok ? [] : parsed.problems, flag).toEqual([`${flag} describes what --new-run reuses, and it registers none`]);
+    }
+    const series = parseRegisterArguments([...NEW_RUN_FLAGS, "--series"]);
+    expect(series.ok ? [] : series.problems).toEqual(["--series registers a new instance, and --new-run registers none"]);
+  });
+
+  it("the help text describes it", () => {
+    expect(USAGE).toContain("register --new-run <instanceId> --template <completed file> --out <file>");
+    expect(USAGE).toContain("One instance per call.");
   });
 });

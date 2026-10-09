@@ -113,6 +113,43 @@ Evidence:
 - `test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`: the
   shipped bundle, against real PostgreSQL and Redis.
 
+## Halts (`C1-HALTS`)
+
+**Every halt ends the run**, whatever its scope: the pump stops and the process
+exits `75`. The scope and its market or instance id say what tripped; they do
+not narrow the stop, and nothing in the process releases a halt. The halt's
+`ops.incidents` rows carry `action` `NULL` (the trader health surface still
+shows `action: "FULL_HALT"`, the one action that happens, because the control
+API's health door requires the field).
+
+A book that falls out of step with the venue is **not** a halt: it waits for
+its next snapshot, and risk check 8 refuses that market's entries and
+reductions meanwhile (cancels still go out). Only a book refusal that signals
+a contract or programming fault — an unknown token, a payload that fails its
+contract — halts, as `BOOK_DESYNCHRONIZED`. The per-market counts are logged at
+the stop (`book refusals: …`).
+
+To continue after a halt, register a new run for the instance and start the
+trader with the document it writes:
+
+```sh
+register --new-run <instanceId> --template <the completed document> --out <new file> --code-commit <commit>
+```
+
+When the new run starts, it marks the instance's earlier OPEN halt rows of the
+infrastructure codes (`TRANSPORT_UNAVAILABLE`, `TRANSPORT_RESYNC_REQUIRED`,
+`STORE_UNAVAILABLE`, `QUEUE_BACKPRESSURE`, `EVENT_UNREADABLE`) `RESOLVED`,
+"superseded by run <id>", so the `TraderHaltOpenOrUnknown` page stops. Every
+other row (the accounting and order-state codes, and `BOOK_DESYNCHRONIZED`)
+stays open until you have read it and resolve it yourself:
+
+```sql
+update ops.incidents set status = 'RESOLVED', resolved_at = now(), resolution = '<why>' where incident_id = '<id>' and status <> 'RESOLVED';
+```
+
+Rows are never deleted: the research worker reads them as retention evidence
+whatever their status.
+
 ## `ownership: "SHADOW"` means OBSERVE here
 
 §6 invariant 11: "One active live strategy owns a market in v1. Other strategies
@@ -190,29 +227,15 @@ both the intent's tags and the emitting instance are still in hand, and the
 venue policy reads that book. An order whose value cannot be resolved is
 refused rather than submitted.
 
-## The risk-seam caveat is wired honestly, and it is VISIBLE
+## A refused exit is counted, never compensated for
 
-`WP-220`'s accepted residual: every exit the Static Bracket emits is a §7.7
-`POSITION` intent, and `packages/risk` derives the disposition from the intent
-TYPE alone, so a protective reduction is classified `ENTRY`. Protective
-reductions are therefore refused inside the entry cutoff, on `CLOSE_ONLY`
-markets, with the entry-shaped staleness code, and — under the default
-`requirePositiveNetEdgeForEntries` — for want of an `expectedNetEdge`.
-
-**This process does not compensate.** It does not re-tag intents, resize them,
-lower a policy bound, retry, or bypass `evaluateIntent`. A refused exit is the
-accepted posture until the risk-side follow-up lands.
-
-**What it does instead is refuse to let the consequence be invisible.** The
-health surface counts refusals of intents the emitting strategy tagged
-protective, broken down by the risk reason code that refused them
-(`risk.refusedExits`, `risk.refusedExitsByCode`), and `riskSeamCaveat` travels
-with every snapshot.
-
-**OBSERVED, not predicted.** In the end-to-end fixture the Static Bracket's
-take-profit is emitted after its entry fills and is refused with
-`RISK_EDGE_INPUTS_MISSING` — the caveat's fourth row, live. The assertion is in
-`test/integration/paper-trader/obligations-wp220.test.ts`.
+This process does not re-tag intents, resize them, lower a policy bound, retry,
+or bypass `evaluateIntent`. `packages/risk` decides an intent's disposition
+from its shape and the supplied portfolio: a sell covered by the instance's
+confirmed holding is an EXIT. The health surface counts refusals of intents
+the strategy tagged protective, by the risk reason code that refused them
+(`risk.refusedExits`, `risk.refusedExitsByCode`); `riskSeamCaveat` says so in
+one sentence on every snapshot.
 
 ## Schema-boundary conformance (ADR-020 §5)
 

@@ -1160,3 +1160,65 @@ incident names a market (`#openWindowIncident`).
 5. **The cost** is an incident that names an id no catalog holds. Its
    `detail` names the window by the condition id or event id it carried. A
    refusal is also in the admission ledger, as a `REFUSED` record.
+
+## Note (2026-10-08, C1-HALTS)
+
+**The ruling.** On 2026-10-08 the user ruled the rule-4 epoch taint NARROW,
+reversing the coarse interim ruling O-I1(ii) of 2026-10-01 (confirmed on
+2026-10-02). The ruling adopts option C of `COMPLEXITY-1`'s deep dive (key
+`TAINT`) with its challenge's three changes. The Decision text above is
+unchanged; this note records what changed in the code.
+
+**Why.** Every market-less incident tainted its gateway epoch for good. In all
+8 recorded H1 runs, the first incident was a reference-venue notice
+(`COINBASE_TOP_OF_BOOK_UNCHANGED`), and the Binance adapter opens
+`BINANCE_SUBSCRIPTION_START_NO_REPLAY` on every first subscription. In 6 of 6
+full runs, the venue's second, identical `tick_size_change` of a pair raised
+`UNASSIGNED_PARAMETER_VERSION`, which the directory refuses as a no-op. None of
+these can drop a Polymarket book frame, but each switched `CONNECTION_CONFIRMED`
+off within seconds or minutes of every start. The losses rule 4 guards
+against (a WAL refusal on the market channel, an unknown event type, a refused
+envelope, a split frame) were observed 0 times.
+
+**What changed** (`packages/trading-core/src/loop.ts`, `taintsEpoch`). A
+`DataQualityIncidentOpened` that names no market taints its epoch only if all
+of these hold:
+
+- its envelope `source` is not a reference venue (`binance`, `coinbase`);
+- its `reasonCode` is not `UNASSIGNED_PARAMETER_VERSION`;
+- its `feedId` is absent (a gateway-wide fault: a frame split, a refused
+  envelope, a publication halt, a WAL write fault), or equals the configured
+  market-channel feed id.
+
+Every other market-channel code still taints, `UNKNOWN_EVENT_TYPE` included.
+An internal incident whose `feedId` names a reference feed (a Binance stall, a
+Coinbase WAL refusal) does not. The taint is still never lifted (option D,
+a liftable taint, was not built).
+
+**The configuration fails safe.** The market-channel feed id is the optional
+`bookFreshness.marketChannelFeedId` of the `CONNECTION_CONFIRMED` arm. It
+defaults to `polymarket-market`, so no operator must set a new knob. A wrong
+value is the unsafe direction: the market channel's own incidents would stop
+tainting. So the trader logs the id at start, and
+`apps/trader/src/market-channel-feed-id.test.ts` pins the trader and gateway
+example configurations equal on it.
+
+**The desync requirement holds.** `C1-HALTS` also made a desynchronized book
+wait for its next snapshot instead of halting the run. A refused update that
+means divergence clears the book's baseline AND its delivery-session key
+(`MarketState.noteBookRefusal`), so sibling frames on the session cannot vouch
+for a book known to be behind: its age is its last applied change (rule 2).
+
+**Pinned** in `packages/trading-core/src/book-freshness.test.ts`, the
+`C1-HALTS TAINT` and `C1-HALTS BOOK-WAITS` blocks: a Binance, a Coinbase and a
+reference-feed stall incident do not taint; the no-op tick-size code does not
+taint; `UNKNOWN_EVENT_TYPE` and a WAL refusal on the market channel, and a
+feedless refused envelope, do; a configured id moves the rule; a waiting book
+reads stale within its bound under `CONNECTION_CONFIRMED`.
+
+**Still open.** The challenge's third change is a burn-in step: establish a
+real `LAST_CHANGE` stale-pause baseline before applying the keep-or-delete rule
+to this basis. The 54% of H1 run 1 is a faulty run, and the "about 9%" cannot
+be checked. The normalizer should also stop raising
+`UNASSIGNED_PARAMETER_VERSION` for an identical tick-size restatement. Both
+are follow-ups of `C1-HALTS`.

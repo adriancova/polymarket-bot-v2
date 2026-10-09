@@ -45,9 +45,12 @@ export {
 } from "./safety.js";
 
 export {
+  DEFAULT_MARKET_CHANNEL_FEED_ID,
   TraderConfigSchema,
+  bookFreshnessBasisOf,
   configuredFeatureKeys,
   configuredSeries,
+  marketChannelFeedIdOf,
   parseTraderConfig,
   type ConfigRefusal,
   type ConfiguredSeries,
@@ -121,7 +124,6 @@ export {
   haltOnLedgerProjection,
   type HaltRecord,
   type HaltReasonCode,
-  type HaltRelease,
   type HaltScope,
 } from "./halt.js";
 
@@ -132,6 +134,7 @@ export {
   type AccountingCounters,
   type AccountingHealth,
   type ExecutionHealth,
+  type HealthHalt,
   type HealthSnapshot,
   type LoopHealth,
   type RealizedPnlHealth,
@@ -265,6 +268,8 @@ export {
   type RegisteredInstance,
   type RegistrationIdentity,
 } from "./instances.js";
+
+export { classifyBookRefusal, type BookRefusalClass, type BookRefusalCounts } from "./book-refusals.js";
 
 export {
   MarketState,

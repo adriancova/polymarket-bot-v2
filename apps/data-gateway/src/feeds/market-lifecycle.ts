@@ -212,7 +212,9 @@
  * `feeds/polymarket.ts` rule). A poll failure — transport, non-2xx, or a
  * body the door refuses — opens a NOTIFY incident scoped to the market
  * (`GATEWAY_LIFECYCLE_POLL_FAILED` / `GATEWAY_LIFECYCLE_STATE_INVALID`) and
- * derives nothing; `consecutiveFailureThreshold` failed polls in a row is a
+ * derives nothing, and that market's next valid poll closes both
+ * (`C1-HALTS`: the close is published, so a consumer un-pauses);
+ * `consecutiveFailureThreshold` failed polls in a row is a
  * STALL: `FeedStale` is published and the gateway's `GATEWAY_FEED_STALL`
  * incident opens exactly as it does for a silent socket (acceptance 2), and
  * the next successful poll closes the episode. A poll cycle that would
@@ -701,6 +703,10 @@ export class MarketLifecycleFeedDriver {
       return;
     }
     this.#pollSucceeded(receipt);
+    // `C1-HALTS` (DQ-CLOSE): THIS market's own poll answered with a valid
+    // state, so its own poll-failure incidents end here — and only its own:
+    // another market's failure is not cleared by this market's success.
+    this.#closeMarketPollIncidents(market);
     const frame: CitedFrame = { receipt, rawFrameIngestSeq: outcome.ingestSeq, connectionId };
     if (market.replayOwed) {
       const replayed = await this.#replay(market, frame);
@@ -718,8 +724,10 @@ export class MarketLifecycleFeedDriver {
   /**
    * Raises `GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` once per poll that left a
    * dispatch unpublished, naming EVERY unconfirmed intent the ledger holds
-   * for the market (r2, LOW-R1). A standing incident is closed and re-raised
-   * when the set it named has changed.
+   * for the market (r2, LOW-R1). A standing incident is REPLACED when the set
+   * it named has changed: the new one opens before the old one closes
+   * (`C1-HALTS` r1, L4), so the market is never without the incident between
+   * them — the close is published, and the trader un-pauses on it.
    */
   #reportUnpublished(market: MarketState): void {
     if (!market.unpublishedThisPoll) return;
@@ -729,18 +737,13 @@ export class MarketLifecycleFeedDriver {
     if (market.reportedUnconfirmed === signature) {
       return; // the standing incident already names exactly this set
     }
-    if (market.reportedUnconfirmed !== undefined) {
-      this.#options.dispatcher.markIncidentClosed(
-        `${this.#options.feedId}:${market.config.internalMarketId}`,
-        "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
-      );
-    }
     market.reportedUnconfirmed = signature;
     this.#openMarketIncident(
       market,
       "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
       "PAGE",
       `${String(owed.length)} lifecycle event(s) for market ${market.config.internalMarketId} are owed to the stream — dispatched but not published (${this.#lastUnpublishedReason ?? "no publisher reason recorded"}), or held back behind an unconfirmed earlier event: ${owed.join("; ")}. Each intent is persisted in the lifecycle ledger and will be re-emitted with the same instant, in order, at the next start — the publisher's "remains in the WAL" describes raw frames, not these derived events`,
+      true,
     );
   }
 
@@ -1087,6 +1090,18 @@ export class MarketLifecycleFeedDriver {
     this.#consecutiveFailures = 0;
   }
 
+  /**
+   * `C1-HALTS` (DQ-CLOSE): closes one market's `GATEWAY_LIFECYCLE_POLL_FAILED`
+   * and `GATEWAY_LIFECYCLE_STATE_INVALID` keys after its own valid poll. The
+   * dispatcher publishes a close only for a key that was open, so a healthy
+   * market's every poll publishes nothing.
+   */
+  #closeMarketPollIncidents(market: MarketState): void {
+    const scope = `${this.#options.feedId}:${market.config.internalMarketId}`;
+    this.#options.dispatcher.markIncidentClosed(scope, "GATEWAY_LIFECYCLE_POLL_FAILED");
+    this.#options.dispatcher.markIncidentClosed(scope, "GATEWAY_LIFECYCLE_STATE_INVALID");
+  }
+
   #pollFailed(market: MarketState, reasonCode: string, detail: string): void {
     this.#pollFailures += 1;
     this.#consecutiveFailures += 1;
@@ -1122,15 +1137,21 @@ export class MarketLifecycleFeedDriver {
     }
   }
 
-  /** A NOTIFY/PAGE incident scoped to one market, carrying `affectedMarketIds`. */
+  /**
+   * A NOTIFY/PAGE incident scoped to one market, carrying `affectedMarketIds`.
+   * `replace` (`C1-HALTS` r1, L4): an incident already open for the key is
+   * replaced — the new one opens, then the old one closes — instead of being
+   * counted as a repeat.
+   */
   #openMarketIncident(
     market: MarketState,
     reasonCode: string,
     severity: IncidentSeverity,
     detail: string,
+    replace = false,
   ): void {
     const scope = `${this.#options.feedId}:${market.config.internalMarketId}`;
-    this.#options.dispatcher.openIncident(
+    this.#options.dispatcher[replace ? "replaceIncident" : "openIncident"](
       { scope, reasonCode, severity, detail, feedId: this.#options.feedId },
       (incidentId) => {
         const payload: DataQualityIncidentOpenedPayload = {

@@ -624,7 +624,8 @@ async function expectOnlyTheHaltRecordAfter(
     severity: "PAGE",
     status: "OPEN",
     failure_class: "TRANSPORT_UNAVAILABLE",
-    action: "FULL_HALT",
+    // C1-HALTS: no §9.9 rung is selected; every halt ends the run.
+    action: null,
     market_id: null,
     instance_id: registered.instanceId,
     data_quality_incident_id: null,
@@ -752,7 +753,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           const halt = after.halts[0];
           expect(halt?.detail).toContain("the event transport is unavailable");
           expect(halt?.detail).toContain("caused by");
-          expect(run.text()).toContain("HALT GLOBAL TRANSPORT_UNAVAILABLE (FULL_HALT): ");
+          expect(run.text()).toContain("HALT GLOBAL TRANSPORT_UNAVAILABLE: ");
 
           // --- nothing traded after it, nothing written; the last writes read back -
           await expectNothingTradedOrWrittenAfter(run, context, registered, before, boundary);

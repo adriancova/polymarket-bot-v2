@@ -50,7 +50,11 @@ import type { PnlSnapshot } from "@polymarket-bot/pnl";
 
 export type { Clock, EventEnvelope, ExecutionVenue, MarketEventSource, RecordedEventIdentity };
 
-/** Why a port could not answer. Named so the loop can pick the §9.9 rung. */
+/**
+ * Why a port could not answer. Named so the caller can pick the halt CODE it
+ * records (e.g. `RESYNC_REQUIRED` → `TRANSPORT_RESYNC_REQUIRED`); every halt
+ * ends the run (`C1-HALTS`), so the kind chooses no rung.
+ */
 export type PortFailureKind =
   /** The connection is gone, refused, or timed out. */
   | "UNAVAILABLE"

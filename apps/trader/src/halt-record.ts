@@ -23,9 +23,9 @@
  * | --- | --- |
  * | `incident_key` | `TRADER_HALT:<scope kind>` — `TRADER_HALT:GLOBAL`, `TRADER_HALT:MARKET`, `TRADER_HALT:STRATEGY_INSTANCE` |
  * | `failure_class` | the halt's reason code (`TRANSPORT_UNAVAILABLE`, `STORE_UNAVAILABLE`, …): §9.9's failure class |
- * | `action` | the halt's §9.9 rung (`FULL_HALT`, `RECONCILE_ACCOUNT`, …), as the controller selected it |
+ * | `action` | `NULL` (`C1-HALTS`): every halt ends the run, so no §9.9 rung is selected; the column is nullable and older rows keep theirs |
  * | `severity` | `PAGE`: every halt stops this process |
- * | `status` | `OPEN`: only an operator resolves it |
+ * | `status` | `OPEN`. A later run resolves only the INFRASTRUCTURE codes ({@link SUPERSEDED_BY_A_NEW_RUN}); every other row stays open until an operator resolves it |
  * | `environment` | `PAPER`, the one mode this process runs in |
  * | `account_ref` | the configuration's `accounting.accountRef` |
  * | `detail` | the halt's own detail, bounded to `internal.detail`'s 2000 characters |
@@ -72,7 +72,8 @@
  * record at the bound, which the pool's own connection timeout ends.
  */
 
-import type { HaltRecord, TraderConfig } from "@polymarket-bot/trading-core";
+import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
+import type { HaltReasonCode, HaltRecord, TraderConfig } from "@polymarket-bot/trading-core";
 import { TRADER_RUN_MODE } from "@polymarket-bot/trading-core";
 
 import { boundedDetail } from "./adapters/postgres-store.js";
@@ -99,7 +100,8 @@ export interface HaltIncidentRow {
   readonly severity: "PAGE";
   readonly status: "OPEN";
   readonly failure_class: string;
-  readonly action: HaltRecord["action"];
+  /** Always `NULL` since `C1-HALTS`: the column is nullable, and no rung is selected. */
+  readonly action: null;
   readonly market_id: string | null;
   readonly instance_id: string | null;
   readonly detail: string;
@@ -122,7 +124,7 @@ export function haltIncidentRows(
       severity: "PAGE" as const,
       status: "OPEN" as const,
       failure_class: halt.code,
-      action: halt.action,
+      action: null,
       detail: boundedDetail(halt.detail),
       opened_at: halt.at,
     };
@@ -154,6 +156,88 @@ export function haltIncidentRows(
     }
   }
   return Object.freeze(rows);
+}
+
+/**
+ * `C1-HALTS` (HALT-PAGES; OPS-04 as amended): the halt codes a NEW RUN of the
+ * same instance supersedes. Each is an infrastructure boundary the process
+ * could not cross — the event transport, the durable store, the ingest queue,
+ * an unreadable event — and a new run that starts is the operator's
+ * acknowledgement: the trader marks that instance's earlier OPEN rows of these
+ * codes `RESOLVED` ("superseded by run <id>") once its registration check
+ * passes (`PostgresTraderStore.resolveSupersededHalts`), so the
+ * `TraderHaltOpenOrUnknown` page stops.
+ *
+ * Every OTHER code stays open until an operator resolves it: the accounting
+ * and order-state codes (`UNATTRIBUTED_ACTIVITY`, `CANCEL_UNRESOLVED`,
+ * `ACCOUNTING_REBUILD_MISMATCH`, …) are the only durable signal of an account
+ * whose state is unexplained, which a fresh run does not repair; and
+ * `BOOK_DESYNCHRONIZED`, since `C1-HALTS` only a contract or programming
+ * fault, is a bug report, not an outage. To resolve one by hand, after reading
+ * it (`apps/trader/README.md`, "Halts"):
+ *
+ * ```sql
+ * update ops.incidents set status = 'RESOLVED', resolved_at = now(), resolution = '<why>' where incident_id = '<id>' and status <> 'RESOLVED';
+ * ```
+ *
+ * The rows are KEPT either way: the research worker's retention evidence reads
+ * them whatever their status.
+ */
+export const SUPERSEDED_BY_A_NEW_RUN: readonly HaltReasonCode[] = Object.freeze([
+  "TRANSPORT_UNAVAILABLE",
+  "TRANSPORT_RESYNC_REQUIRED",
+  "STORE_UNAVAILABLE",
+  "QUEUE_BACKPRESSURE",
+  "EVENT_UNREADABLE",
+]);
+
+/**
+ * `C1-HALTS` (HALT-PAGES): marks each starting run's instance's earlier OPEN
+ * halt rows of the {@link SUPERSEDED_BY_A_NEW_RUN} codes `RESOLVED`,
+ * "superseded by run <id>". Called once the registration check has passed, so
+ * every run here is a run `BOOT-1` accepted as new. The rows matched are the
+ * trader's (`TRADER_HALT:*` keys), `PAPER`, naming that instance — a GLOBAL
+ * halt writes one row per instance (module header), and every infrastructure
+ * code is latched GLOBAL. NEVER throws and never refuses the start: a failure
+ * is logged and the rows stay open (the page goes on, which is the safe side).
+ * Answers how many rows it resolved, or `undefined` when it failed.
+ */
+export async function resolveSupersededHalts(
+  db: PolymarketBotDatabase,
+  runs: readonly { readonly instanceId: string; readonly runId: string }[],
+  log: (line: string) => void,
+): Promise<number | undefined> {
+  let resolved = 0;
+  try {
+    for (const run of runs) {
+      const result = await db
+        .updateTable("ops.incidents")
+        .set((eb) => ({
+          status: "RESOLVED",
+          resolved_at: eb.fn<string>("now", []),
+          resolution: `superseded by run ${run.runId}`,
+        }))
+        .where("incident_key", "in", Object.values(HALT_INCIDENT_KEYS))
+        .where("environment", "=", TRADER_RUN_MODE)
+        .where("status", "<>", "RESOLVED")
+        .where("instance_id", "=", run.instanceId)
+        .where("failure_class", "in", [...SUPERSEDED_BY_A_NEW_RUN])
+        .executeTakeFirst();
+      resolved += Number(result.numUpdatedRows);
+    }
+  } catch (cause) {
+    log(
+      `halt rows: the earlier infrastructure halts of this run's instance(s) could not be marked superseded ` +
+        `(${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}); they stay OPEN and keep ` +
+        "paging until resolved by hand (apps/trader/README.md, \"Halts\")",
+    );
+    return undefined;
+  }
+  log(
+    `halt rows: ${String(resolved)} earlier OPEN infrastructure halt row(s) of this run's instance(s) marked ` +
+      "RESOLVED (superseded by the new run); accounting and order-state halts stay open for an operator",
+  );
+  return resolved;
 }
 
 /** What the bounded write answered (`PostgresTraderStore.recordHalts`). */

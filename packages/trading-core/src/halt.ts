@@ -1,6 +1,6 @@
 /**
- * The halt controller — handoff §4.2 failure boundaries and §9.9's action
- * ladder, plus the `WP-200` composition-root obligation.
+ * The halt controller — handoff §4.2 failure boundaries, plus the `WP-200`
+ * composition-root obligation.
  *
  * §9.9 is explicit that the Incident Controller — "not the ordinary risk gate"
  * — originates operational safety actions, and `WP-200`'s round-2 follow-up 2
@@ -20,21 +20,28 @@
  *
  * ## What "halt" means here, precisely
  *
- * A halt is a LATCH, not a flag that policy can clear. Once a scope is halted:
+ * A halt is a LATCH, not a flag that policy can clear, and EVERY HALT ENDS THE
+ * RUN (`C1-HALTS`, the user's ruling of 2026-10-08): whatever its scope, the
+ * pump stops at the next boundary and the process exits `EXIT_CODES.halted`
+ * (75); the operator starts a NEW run (`BOOT-1`). Until the pump stops:
  *
- * - the core loop makes **no trading decision** for it: no strategy is
- *   evaluated, no intent is risk-checked, no plan is built and nothing is
- *   submitted. A fill or an order view that arrives afterwards — including one
- *   whose OWN iteration latched the halt — is still BOOKED and is **not**
- *   delivered to the strategy (`loop.ts` §"No trading decision on stale or
- *   absent state" lists the four gates, and
+ * - the core loop makes **no trading decision** for the halted scope: no
+ *   strategy is evaluated, no intent is risk-checked, no plan is built and
+ *   nothing is submitted (and risk check 1 refuses every placement anywhere,
+ *   `runStatePermitsIntent` being `!anyHalt`). A fill or an order view that
+ *   arrives afterwards — including one whose OWN iteration latched the halt —
+ *   is still BOOKED and is **not** delivered to the strategy (`loop.ts`
+ *   §"No trading decision on stale or absent state" lists the four gates, and
  *   `health.loop.deliveriesSuppressedByHalt` counts what they withheld);
- * - the reason and the instant are retained and reported on the health surface;
- * - only an explicit operator act (a new run) clears it. `release` exists for
- *   the ACCOUNT-scope resync case that §7.1 defines — "a restart or detected
- *   gap requires a new authoritative snapshot before affected markets resume" —
- *   and it demands the same evidence the transport does, so a caller cannot
- *   un-stick a halt merely by wanting the events to flow again.
+ * - the reason and the instant are retained and reported on the health surface.
+ *
+ * Nothing in this process releases a halt. The {@link HaltScope} and its
+ * market or instance id are DIAGNOSTIC data: they say what tripped, and the
+ * durable halt row (`apps/trader/src/halt-record.ts`) carries them as the
+ * columns the research worker's retention evidence reads. They do not narrow
+ * the stop. (Until `C1-HALTS` a §9.9 "action" rung was attached to each record
+ * and a `release` method existed; neither was ever acted on, so both were
+ * removed rather than kept as promises.)
  *
  * ## §4.2 is the source of the failure classes
  *
@@ -117,60 +124,24 @@ export type HaltReasonCode =
   | "RUNTIME_PERSISTENCE_FAILED"
   /** An event arrived that the trader cannot read as a §7.1 envelope. */
   | "EVENT_UNREADABLE"
-  /** A book refused an update, so the local book is no longer authoritative. */
-  | "BOOK_DESYNCHRONIZED"
-  /** An operator-requested stop. */
-  | "OPERATOR_HALT";
+  /**
+   * `C1-HALTS`: a book refused an update for a reason that signals a contract
+   * or programming fault — the payload names a token or market this book is
+   * not, or fails its own frozen contract, or a trading parameter contradicts
+   * an applied one (`book-refusals.ts`, class FAULT). A book that merely fell
+   * out of step with the venue (no baseline yet, a newer generation, another
+   * epoch) is NOT a halt: it waits for its next snapshot.
+   */
+  | "BOOK_DESYNCHRONIZED";
 
 export interface HaltRecord {
+  /** What tripped: diagnostic only — every halt ends the run (module header). */
   readonly scope: HaltScope;
   readonly code: HaltReasonCode;
   readonly detail: string;
   /** Strict-UTC instant from the injected clock. Never a wall-clock read here. */
   readonly at: string;
-  /**
-   * The §9.9 action this failure class selects.
-   *
-   * A recommendation the operator and the (later) Incident Controller act on;
-   * this module performs only the part §9.9 assigns to the process itself —
-   * making no further trading decision for the scope.
-   */
-  readonly action:
-    | "HALT_NEW_ENTRIES"
-    | "CANCEL_RESTING_ORDERS"
-    | "RECONCILE_ACCOUNT"
-    | "MANAGE_KNOWN_POSITIONS_ONLY"
-    | "PROTECTED_REDUCE"
-    | "HOLD_TO_RESOLUTION"
-    | "FULL_HALT";
 }
-
-/**
- * The §9.9 action each failure class selects.
- *
- * Every entry is `FULL_HALT` or a strictly weaker rung, and the mapping is
- * data so a reviewer can read the whole policy at once instead of chasing
- * branches. `UNATTRIBUTED_ACTIVITY` maps to `RECONCILE_ACCOUNT` because §9.9's
- * table gives "account state unknown" exactly that treatment before the full
- * halt, and the scope-level latch already stops decisions either way.
- */
-const ACTION_FOR: Readonly<Record<HaltReasonCode, HaltRecord["action"]>> = Object.freeze({
-  TRANSPORT_UNAVAILABLE: "FULL_HALT",
-  TRANSPORT_RESYNC_REQUIRED: "FULL_HALT",
-  STORE_UNAVAILABLE: "FULL_HALT",
-  QUEUE_BACKPRESSURE: "FULL_HALT",
-  UNATTRIBUTED_ACTIVITY: "RECONCILE_ACCOUNT",
-  UNEXPLAINED_ACTUAL_MOVEMENT: "RECONCILE_ACCOUNT",
-  LEDGER_POSTING_REFUSED: "FULL_HALT",
-  ACCOUNTING_REBUILD_MISMATCH: "FULL_HALT",
-  CANCEL_UNRESOLVED: "MANAGE_KNOWN_POSITIONS_ONLY",
-  BASKET_PARTIALLY_EXECUTED: "MANAGE_KNOWN_POSITIONS_ONLY",
-  VENUE_OBSERVATION_FAILED: "RECONCILE_ACCOUNT",
-  RUNTIME_PERSISTENCE_FAILED: "FULL_HALT",
-  EVENT_UNREADABLE: "FULL_HALT",
-  BOOK_DESYNCHRONIZED: "CANCEL_RESTING_ORDERS",
-  OPERATOR_HALT: "FULL_HALT",
-});
 
 function scopeKey(scope: HaltScope): string {
   switch (scope.kind) {
@@ -181,28 +152,6 @@ function scopeKey(scope: HaltScope): string {
     case "STRATEGY_INSTANCE":
       return `STRATEGY_INSTANCE:${scope.instanceId}`;
   }
-}
-
-/**
- * Evidence a caller must produce to release a halt — at ANY scope.
- *
- * The literal `true` is the point, and it is the same shape
- * `packages/event-bus` demands for a hard-resync acknowledgement: §7.1 makes an
- * authoritative snapshot mandatory after a gap, so a release that could be
- * requested without one would be a release that permits the silent catch-up
- * ADR-003 §3.3 forbids.
- *
- * SCOPE (review round 2, note N1). This paragraph used to say "an ACCOUNT-level
- * halt" while {@link HaltController.release} accepted any {@link HaltScope} —
- * `GLOBAL`, `MARKET` and `STRATEGY_INSTANCE` — and demanded the same evidence
- * for each. The implementation is the correct one and the sentence was the
- * stale half: §9.17 requires reconciliation before resuming whatever the halt's
- * scope, and a market-scoped halt released without an authoritative snapshot is
- * the same silent catch-up on a smaller surface. Documented as it behaves.
- */
-export interface HaltRelease {
-  readonly authoritativeSnapshotApplied: true;
-  readonly reason: string;
 }
 
 /**
@@ -225,7 +174,6 @@ export class HaltController {
       code,
       detail,
       at,
-      action: ACTION_FOR[code],
     });
     this.#halts.set(key, record);
     return record;
@@ -261,17 +209,6 @@ export class HaltController {
         .map(([, record]) => record),
     );
   }
-
-  /**
-   * Releases one scope, against evidence.
-   *
-   * Answers whether anything was released, so a caller cannot mistake an
-   * acknowledgement of a halt that never existed for a recovery.
-   */
-  release(scope: HaltScope, evidence: HaltRelease): boolean {
-    if (evidence.authoritativeSnapshotApplied !== true) return false;
-    return this.#halts.delete(scopeKey(scope));
-  }
 }
 
 /**
@@ -296,8 +233,8 @@ export class HaltController {
  * caller knows and the projection does not — the loop passes one for a fill
  * whose owner lookup MISSED (an unknown order, or a settled one whose tombstone
  * names a PROBABLE owner). The note is appended to the `UNATTRIBUTED_ACTIVITY`
- * detail of the record that transaction produced; it changes no scope, code or
- * action, and a halt latched earlier for the same scope keeps its first record,
+ * detail of the record that transaction produced; it changes no scope or
+ * code, and a halt latched earlier for the same scope keeps its first record,
  * as every repeat does.
  */
 export function haltOnLedgerProjection(

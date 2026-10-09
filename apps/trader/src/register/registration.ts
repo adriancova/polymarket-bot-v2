@@ -52,9 +52,9 @@
  * other row is written, and every other rule applies, exactly as above.
  *
  * So a re-run of the same command is refused before any write, with the
- * existing identities named. Registering a SECOND run for an existing instance
- * (`BOOT-1`'s remedy for a run that already holds decisions) is not this
- * command's; it says so.
+ * existing identities named. A SECOND run for an existing instance (`BOOT-1`'s
+ * remedy for a run that already holds decisions) is `register --new-run`'s
+ * (`C1-HALTS`, `new-run.ts`).
  */
 
 import {
@@ -235,7 +235,7 @@ export async function registerRows(
           "repeated, and a registered market or instance is never reused or shadowed. If an " +
           "earlier run of this command registered them, its completed document names them. " +
           "A NEW run for an existing instance (BOOT-1's remedy for a run that already holds " +
-          "decisions) is not this command's: startRun, then point the document's runId at it",
+          "decisions) is register --new-run <instanceId> on the completed document",
         issues: duplicates,
       },
     };

@@ -59,12 +59,12 @@
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import type { GatewayConfigurationError, GatewayStateError } from "@polymarket-bot/data-gateway";
-import { LIFECYCLE_LEDGER_FILE_NAME } from "@polymarket-bot/data-gateway";
+import { GatewayDispatcher, LIFECYCLE_LEDGER_FILE_NAME } from "@polymarket-bot/data-gateway";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { applyMarketEvent, createUniverseRegistry, registerMarket } from "@polymarket-bot/universe";
 import type { UniverseRegistry } from "@polymarket-bot/universe";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createFaultyWalFileSystem } from "./support/faulty-file-system.js";
 import {
@@ -1089,22 +1089,46 @@ describe("UNIV-4 r2 MEDIUM-R1 — a replay stops at the first event that does no
       idSeed: 0,
       startupTransportFailure: "redis unreachable at startup",
     });
-    first.gateway.start();
-    await first.settle();
-    const openIncidents = first.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED");
-    expect(openIncidents).toHaveLength(1);
-    expect(openIncidents[0]?.detail).toContain("1 lifecycle event(s)");
-    await pollOnce(first); // the venue closes while the open is still owed
-    await first.gateway.stop();
+    // `C1-HALTS` r1 (L4): every incident open and close the gateway
+    // dispatches, in order (publication is halted here, so the order is read
+    // at the dispatch funnel).
+    const dispatched: [string, unknown][] = [];
+    const original = GatewayDispatcher.prototype.dispatch;
+    const spy = vi.spyOn(GatewayDispatcher.prototype, "dispatch").mockImplementation(function (this: GatewayDispatcher, ...args) {
+      const [draft] = args;
+      if (draft.eventType === "DataQualityIncidentOpened" || draft.eventType === "DataQualityIncidentClosed") {
+        dispatched.push([draft.eventType, (draft.payload as { incidentId: unknown }).incidentId]);
+      }
+      return original.apply(this, args);
+    });
+    try {
+      first.gateway.start();
+      await first.settle();
+      const openIncidents = first.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED");
+      expect(openIncidents).toHaveLength(1);
+      expect(openIncidents[0]?.detail).toContain("1 lifecycle event(s)");
+      await pollOnce(first); // the venue closes while the open is still owed
+      await first.gateway.stop();
+    } finally {
+      spy.mockRestore();
+    }
     expect(first.gateway.metrics().lifecycle).toMatchObject({
       marketClosingObservedEmitted: 1,
       eventsHeldBack: 1,
       eventsUnpublished: 1,
       phases: { [MARKET.internalMarketId]: "CLOSED_OBSERVED" },
     });
-    // The standing incident was closed and a fresh one names the whole set.
+    // The standing incident was REPLACED by a fresh one naming the whole set:
+    // the fresh one is opened BEFORE the standing one is closed (r1, L4), so
+    // the market is never without the incident in between.
     const grown = first.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED");
     expect(grown).toHaveLength(2);
+    const [standing, fresh] = grown.map((incident) => incident.incidentId);
+    expect(dispatched.filter(([, incidentId]) => incidentId === standing || incidentId === fresh)).toEqual([
+      ["DataQualityIncidentOpened", standing],
+      ["DataQualityIncidentOpened", fresh],
+      ["DataQualityIncidentClosed", standing],
+    ]);
     expect(grown[1]?.detail).toContain("2 lifecycle event(s)");
     expect(grown[1]?.detail).toContain("MarketOpened openedAt");
     expect(grown[1]?.detail).toContain("MarketClosing (observed) closesAt");
@@ -1580,6 +1604,50 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
       ["GATEWAY_LIFECYCLE_POLL_FAILED", [MARKET.internalMarketId]],
       ["GATEWAY_LIFECYCLE_STATE_INVALID", [MARKET.internalMarketId]],
     ]);
+  });
+
+  it("C1-HALTS DQ-CLOSE: a market's OWN valid poll closes its own poll-failure incidents — published, naming their ids — and another market's does not", async () => {
+    const second = {
+      ...LIFECYCLE_MARKET,
+      internalMarketId: "01990000-0000-7000-8000-000000000002",
+      conditionId: "0x" + "cd".repeat(31),
+      yesTokenId: "33333",
+      noTokenId: "44444",
+      gammaMarketId: "900002",
+    } as const;
+    // Each cycle polls the two markets in order: [first, second].
+    const stub = gammaStub([
+      { status: 503, body: '{"error":"maintenance"}' }, // first: fails
+      { status: 503, body: '{"error":"maintenance"}' }, // second: fails
+      { body: READY }, // first: its own valid poll
+      { body: gammaMarket({ active: "true" }) }, // second: still failing (an undocumented body)
+    ]);
+    const harness = await buildHarness({
+      config: lifecycleConfig({ markets: [LIFECYCLE_MARKET, second] }),
+      http: stub.route,
+    });
+    harness.gateway.start();
+    await harness.settle();
+    const opened = harness.publishedOfType("DataQualityIncidentOpened").map(payloadOf);
+    const idOf = (marketId: string, reasonCode: string): unknown =>
+      opened.find(
+        (payload) =>
+          payload["reasonCode"] === reasonCode && (payload["affectedMarketIds"] as readonly string[] | undefined)?.[0] === marketId,
+      )?.["incidentId"];
+    const firstFailed = idOf(MARKET.internalMarketId, "GATEWAY_LIFECYCLE_POLL_FAILED");
+    expect(firstFailed).toBeDefined();
+    expect(harness.publishedOfType("DataQualityIncidentClosed")).toEqual([]);
+
+    await pollOnce(harness);
+    await harness.gateway.stop();
+    // The first market's valid poll closed ITS incident, and only it.
+    const closes = harness.publishedOfType("DataQualityIncidentClosed").map(payloadOf);
+    expect(closes.map((payload) => [payload["incidentId"], payload["resolutionCode"]])).toEqual([
+      [firstFailed, "GATEWAY_CONDITION_CLEARED"],
+    ]);
+    // The second market's incidents stay open: its own poll has not succeeded.
+    expect(idOf(second.internalMarketId, "GATEWAY_LIFECYCLE_POLL_FAILED")).toBeDefined();
+    expect(harness.gateway.metrics().lifecycle?.pollFailures).toBe(3);
   });
 
   it("a WAL refusal suppresses the derivation and opens a PAGE incident (acceptance 1, the other half)", async () => {

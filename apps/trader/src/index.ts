@@ -124,7 +124,6 @@ export {
   haltOnLedgerProjection,
   type HaltRecord,
   type HaltReasonCode,
-  type HaltRelease,
   type HaltScope,
 } from "@polymarket-bot/trading-core";
 

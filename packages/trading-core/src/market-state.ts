@@ -17,10 +17,12 @@
  * replace-not-accumulate, `"0"` removes the level), the epoch and
  * subscription-generation gating, and the exact-decimal queries. This module
  * routes payloads into it and reads its answers; it computes no book arithmetic
- * of its own. A refusal from the book is a REFUSAL here too — the loop halts
- * the market with `BOOK_DESYNCHRONIZED` — because §9.8 check 8 ("book is
- * synchronized") is a risk gate, and a book that refused an update is a book
- * that no longer describes the venue.
+ * of its own. A refusal from the book is a REFUSAL here too, classified by
+ * `book-refusals.ts` (`C1-HALTS`): a benign drop is counted; a divergence
+ * clears that book's baseline and delivery-session key
+ * ({@link MarketState.noteBookRefusal}), so §9.8 check 8 ("book is
+ * synchronized") refuses the market's placements until the next applied
+ * snapshot re-arms it; a contract or programming fault halts the run.
  *
  * ## The trade window is bounded and time-ordered
  *
@@ -43,10 +45,11 @@
  * UTC by `time.ts`.
  */
 
-import { MarketOutcomeBooks, serializeBook, type OutcomeTokenBook } from "@polymarket-bot/order-book";
+import { MarketOutcomeBooks, serializeBook, type BookIngestMeta, type OutcomeTokenBook } from "@polymarket-bot/order-book";
 import { prepareEvaluationView } from "@polymarket-bot/strategy-runtime";
 import type { MarketView, OrderBookView } from "@polymarket-bot/strategy-sdk";
 
+import type { BookRefusalClass, BookRefusalCounts } from "./book-refusals.js";
 import type { MarketConfig } from "./config.js";
 
 /** One observed public trade, kept for the feature engine's window. */
@@ -153,6 +156,11 @@ export class MarketState {
     this.#incidents.set(incident.incidentId, incident);
   }
 
+  /** Whether this market's active set holds the incident (`C1-HALTS`: a close is routed by it). */
+  holdsIncident(incidentId: string): boolean {
+    return this.#incidents.has(incidentId);
+  }
+
   closeIncident(incidentId: string): void {
     this.#incidents.delete(incidentId);
   }
@@ -231,6 +239,39 @@ export class MarketState {
   noteBookSession(outcome: "YES" | "NO", sessionKey: string | undefined): void {
     this.#bookSessions[outcome] = sessionKey;
   }
+
+  /**
+   * `C1-HALTS` (BOOK-WAITS): records one refused book update the loop did not
+   * halt on. A `DIVERGENCE` clears that outcome's baseline — risk check 8
+   * then refuses the market's placements, entries and reductions alike — and
+   * its delivery-session key, so no sibling frame on the session can vouch
+   * for a book known to be behind (ADR-023 rule 2: its age is its last
+   * APPLIED change). The next applied `BookSnapshot` re-baselines the book and
+   * notes its session again: nothing else re-arms it, and nothing needs to.
+   */
+  noteBookRefusal(refusalClass: Exclude<BookRefusalClass, "FAULT">, outcome: "YES" | "NO", refused: BookIngestMeta): void {
+    if (refusalClass === "BENIGN") {
+      this.#bookRefusals.benign += 1;
+      return;
+    }
+    this.#bookRefusals.divergence += 1;
+    // r1 (L3): the refused update's meta raises the book's floor, so a
+    // superseded or replayed snapshot cannot re-arm it.
+    this.bookFor(outcome).clearBaseline(refused);
+    this.#bookSessions[outcome] = undefined;
+  }
+
+  /** `C1-HALTS`: this market's book-refusal counts, and which books wait for a snapshot. */
+  bookRefusals(): BookRefusalCounts {
+    const waiting = (["NO", "YES"] as const).filter((outcome) => this.bookFor(outcome).baseline() === undefined);
+    return Object.freeze({
+      benign: this.#bookRefusals.benign,
+      divergence: this.#bookRefusals.divergence,
+      waiting: Object.freeze(waiting),
+    });
+  }
+
+  readonly #bookRefusals = { benign: 0, divergence: 0 };
 
   /** The delivery session of one outcome's last applied update (ADR-023). */
   bookSession(outcome: "YES" | "NO"): string | undefined {

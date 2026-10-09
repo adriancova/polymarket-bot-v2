@@ -187,7 +187,6 @@ function realSnapshot(): HealthSnapshot {
         code: "BOOK_DESYNCHRONIZED",
         detail: "a book refused an update",
         at: "2026-09-05T00:00:09.000Z",
-        action: "CANCEL_RESTING_ORDERS",
       },
     ],
     queues: [
@@ -251,6 +250,10 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     expect(report.maximumRunMode).toBe("PAPER");
     expect(report.healthy).toBe(false);
     expect(report.halts).toHaveLength(1);
+    // C1-HALTS: the record carries no rung; the surface states the one action
+    // that happens, because this door (and the `trader_halt_info` label)
+    // still require the field.
+    expect(report.halts[0]?.action).toBe("FULL_HALT");
     expect(report.queues).toHaveLength(2);
     expect(report.execution.observeOnlyIntents).toBe(2);
     expect(report.loop.deliveriesSuppressedByHalt).toBe(2);
@@ -357,7 +360,9 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     if (!result.ok) return;
     // The real constant, from the real trader — not a paraphrase.
     expect(result.value.riskSeamCaveat).toBe(RISK_SEAM_CAVEAT);
-    expect(result.value.riskSeamCaveat).toContain("WP-220 accepted residual");
+    // C1-HALTS (TRADE-09): one present-tense sentence, no superseded history.
+    expect(result.value.riskSeamCaveat).toContain("refusedExits counts risk refusals");
+    expect(result.value.riskSeamCaveat).not.toContain("SUPERSEDED");
   });
 
   it("keeps the empty queue's null age as null, and the other queue's number", () => {

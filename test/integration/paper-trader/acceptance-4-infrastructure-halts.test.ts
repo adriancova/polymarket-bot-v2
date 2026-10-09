@@ -54,7 +54,6 @@ describe("acceptance 4 — Redis / PostgreSQL failures halt safely", () => {
       expect(result.ingested).toBe(0);
       const halt = run.trader.halts.globalHalt();
       expect(halt?.code).toBe("TRANSPORT_UNAVAILABLE");
-      expect(halt?.action).toBe("FULL_HALT");
       expect(halt?.detail).toContain("§4.2");
     });
 
@@ -134,7 +133,6 @@ describe("acceptance 4 — Redis / PostgreSQL failures halt safely", () => {
 
       const halt = run.trader.halts.globalHalt();
       expect(halt?.code).toBe("STORE_UNAVAILABLE");
-      expect(halt?.action).toBe("FULL_HALT");
       // §6 invariant 3 is the reason, and the halt says so.
       expect(halt?.detail).toContain("§6 invariant 3");
 
@@ -200,7 +198,7 @@ describe("acceptance 4 — Redis / PostgreSQL failures halt safely", () => {
   });
 
   describe("a halt does not clear itself", () => {
-    it("release REQUIRES the authoritative-snapshot evidence ADR-003 §3.3 demands", async () => {
+    it("C1-HALTS: nothing releases it — the controller has no release seam, and the pump stays stopped", async () => {
       const run = assembleOrThrow();
       run.parts.feed.fail("RESYNC_REQUIRED", "retention exceeded");
       await pump({
@@ -210,22 +208,15 @@ describe("acceptance 4 — Redis / PostgreSQL failures halt safely", () => {
         maxPolls: 2,
       });
       expect(run.trader.halts.globalHalt()).toBeDefined();
-
-      // A caller that merely wants events flowing again cannot say so: the
-      // literal `true` is the type, and a `false` release is refused.
-      const refused = run.trader.halts.release(
-        { kind: "GLOBAL" },
-        { authoritativeSnapshotApplied: false as unknown as true, reason: "please" },
-      );
-      expect(refused).toBe(false);
+      expect("release" in run.trader.halts).toBe(false);
+      const again = await pump({
+        loop: run.trader.loop,
+        feed: run.parts.feed,
+        halts: run.trader.halts,
+        maxPolls: 2,
+      });
+      expect(again.stopped).toBe("HALTED");
       expect(run.trader.halts.globalHalt()).toBeDefined();
-
-      const released = run.trader.halts.release(
-        { kind: "GLOBAL" },
-        { authoritativeSnapshotApplied: true, reason: "snapshot re-applied by operator" },
-      );
-      expect(released).toBe(true);
-      expect(run.trader.halts.globalHalt()).toBeUndefined();
     });
   });
 });

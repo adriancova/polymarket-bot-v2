@@ -107,6 +107,7 @@ function fakeLoop(journal: string[], halts: HaltController, options: FakeLoopOpt
       return options.durable?.() ?? Promise.resolve(true);
     },
     health: () => ({ asOf: AT, halts: halts.records() }),
+    bookRefusals: () => ({}),
     checkAccountingRebuild: (trigger: "SHUTDOWN" | "END_OF_RUN") => {
       journal.push(`rebuild check ${trigger}`);
       if (options.mismatch === true) {
@@ -435,7 +436,7 @@ describe("fail closed: a stop clears no halt (TRADER-SIGNALS)", () => {
     ]);
     expect(lineStarting(h.lines, "pump stopped: ")).toBe("pump stopped: HALTED after 1 poll(s)");
     expect(h.lines).toContain(
-      "HALT MARKET UNATTRIBUTED_ACTIVITY (RECONCILE_ACCOUNT): a balance moved with no attribution",
+      "HALT MARKET UNATTRIBUTED_ACTIVITY: a balance moved with no attribution",
     );
     expect(h.records.map((row) => [row.incident_key, row.failure_class])).toStrictEqual([["TRADER_HALT:MARKET", "UNATTRIBUTED_ACTIVITY"]]);
     expect(h.lines.at(-1)).toBe(
@@ -539,7 +540,7 @@ describe("fail closed: a stop clears no halt (TRADER-SIGNALS)", () => {
     h.signal("SIGTERM");
     expect(await h.run()).toBe(EXIT_CODES.halted);
     expect(h.lines).toContain(
-      "HALT GLOBAL STORE_UNAVAILABLE (FULL_HALT): the pool lost an idle connection (latched during the stop, " +
+      "HALT GLOBAL STORE_UNAVAILABLE: the pool lost an idle connection (latched during the stop, " +
         "after the halt record was written; it is not in ops.incidents)",
     );
     expect(h.lines.at(-1)).toMatch(/^trader stopped: exit 75 — halted: 1 halt\(s\) latched/u);

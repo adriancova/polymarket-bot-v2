@@ -547,3 +547,45 @@ describe("queries (§9.4 tracked values)", () => {
     expect(book.stalenessMs(0)).toEqual({ known: false, reason: "NO_RECEIVED_AT" });
   });
 });
+
+describe("clearBaseline (C1-HALTS: a consumer makes a diverged book wait for its next snapshot)", () => {
+  it("forgets the baseline: a later level change is refused NO_BASELINE, the levels are kept, and the next snapshot re-baselines", () => {
+    const book = seededBook();
+    book.clearBaseline();
+    expect(book.baseline()).toBeUndefined();
+    expect(book.levels("BID")).toEqual([
+      { price: "0.08", size: "33343.4" },
+      { price: "0.07", size: "5000" },
+    ]);
+    const change = book.applyLevelChange({ payload: levelChangePayload(), meta: meta({ ingestSeq: "11" }) });
+    expect(change.applied ? undefined : change.refusal.code).toBe("ORDER_BOOK_NO_BASELINE_SNAPSHOT");
+    // Any well-formed snapshot of the epoch re-baselines it, whatever its sequence.
+    const snapshot = book.applySnapshot({ payload: snapshotPayload(), meta: meta({ ingestSeq: "12", subscriptionGeneration: 2 }) });
+    expect(snapshot.applied).toBe(true);
+    expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_A, subscriptionGeneration: 2 });
+    expect(book.applyLevelChange({ payload: levelChangePayload(), meta: meta({ ingestSeq: "13", subscriptionGeneration: 2 }) }).applied).toBe(true);
+  });
+
+  it("r1 (L3): a waiting book keeps its epoch's floor — a superseded-generation or replayed snapshot is refused (benign codes), a current one re-arms it", () => {
+    const book = seededBook(); // generation 1, ingestSeq 10
+    // A delta of generation 2 is refused (a newer subscription) and the
+    // consumer makes the book wait, naming the refused update.
+    const ahead = meta({ ingestSeq: "11", subscriptionGeneration: 2 });
+    const refused = book.applyLevelChange({ payload: levelChangePayload(), meta: ahead });
+    expect(refused.applied ? undefined : refused.refusal.code).toBe("ORDER_BOOK_GENERATION_AHEAD_REQUIRES_SNAPSHOT");
+    book.clearBaseline(ahead);
+    // The in-flight REST fetch for generation 1's gap lands: superseded.
+    const superseded = book.applySnapshot({ payload: snapshotPayload(), meta: meta({ ingestSeq: "12", subscriptionGeneration: 1 }) });
+    expect(superseded.applied ? undefined : superseded.refusal.code).toBe("ORDER_BOOK_STALE_SUBSCRIPTION_GENERATION");
+    // A replay of a sequence the book has seen: refused.
+    const replayed = book.applySnapshot({ payload: snapshotPayload(), meta: meta({ ingestSeq: "11", subscriptionGeneration: 2 }) });
+    expect(replayed.applied ? undefined : replayed.refusal.code).toBe("ORDER_BOOK_OUT_OF_ORDER_INGEST");
+    expect(book.baseline()).toBeUndefined();
+    // Generation 2's own snapshot re-arms it, and clears the floor.
+    expect(book.applySnapshot({ payload: snapshotPayload(), meta: meta({ ingestSeq: "13", subscriptionGeneration: 2 }) }).applied).toBe(true);
+    expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_A, subscriptionGeneration: 2 });
+    // ANOTHER epoch is identity, not chronology: its snapshot applies whatever its numbers.
+    book.clearBaseline(meta({ ingestSeq: "14", subscriptionGeneration: 3 }));
+    expect(book.applySnapshot({ payload: snapshotPayload(), meta: meta({ gatewayEpoch: EPOCH_B, ingestSeq: "1", subscriptionGeneration: 1 }) }).applied).toBe(true);
+  });
+});

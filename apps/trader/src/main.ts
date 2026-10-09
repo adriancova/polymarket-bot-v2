@@ -241,7 +241,12 @@ import { DEFAULT_CONNECTION_TIMEOUT_MS, createDatabase, createPostgresPool } fro
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
 import { RedisMarketEventFeed } from "./adapters/redis-feed.js";
-import { parseTraderConfig, type TraderConfig } from "@polymarket-bot/trading-core";
+import {
+  bookFreshnessBasisOf,
+  marketChannelFeedIdOf,
+  parseTraderConfig,
+  type TraderConfig,
+} from "@polymarket-bot/trading-core";
 import { RealizedPnlBook } from "@polymarket-bot/trading-core";
 import {
   readHealthServerEnv,
@@ -249,7 +254,7 @@ import {
   type HealthListen,
   type RunningTraderHealthServer,
 } from "./health-server.js";
-import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
+import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit, resolveSupersededHalts } from "./halt-record.js";
 import { PROCESS_EXIT_GRACE_MS, exitAfterStartup, processExitPorts } from "./process-exit.js";
 import {
   SHUTDOWN_DEADLINE_ENV,
@@ -649,9 +654,12 @@ export async function runUntilStopped(options: RunUntilStoppedOptions): Promise<
           "its rebuild from zero (see the ACCOUNTING_REBUILD_MISMATCH halt)",
   );
   for (const halt of health.halts) {
-    log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
+    log(`HALT ${halt.scope.kind} ${halt.code}: ${halt.detail}`);
   }
   log(`health: ${JSON.stringify(health)}`);
+  // `C1-HALTS` (BOOK-WAITS): per market, the book refusals counted (benign)
+  // or waited out (divergence), and the books still waiting for a snapshot.
+  log(`book refusals: ${JSON.stringify(trader.loop.bookRefusals())}`);
 
   // --- 5c. `PROVENANCE-1` (`OUT1-R1-HALT-NOT-DURABLE`): every latched halt,
   // written to `ops.incidents` BEFORE anything is closed, bounded, and never
@@ -692,7 +700,7 @@ export async function runUntilStopped(options: RunUntilStoppedOptions): Promise<
   for (const halt of latched) {
     if (recorded.has(haltIdentity(halt))) continue;
     log(
-      `HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail} ` +
+      `HALT ${halt.scope.kind} ${halt.code}: ${halt.detail} ` +
         "(latched during the stop, after the halt record was written; it is not in ops.incidents)",
     );
   }
@@ -893,6 +901,15 @@ export async function assembleDurableTrader(
       `${String(config.instances.length + (config.seriesInstances?.length ?? 0))} instance(s) and their run(s) exist and agree with ` +
       "the configuration",
   );
+  // `C1-HALTS` (TAINT): the feed whose market-less incidents switch the
+  // CONNECTION_CONFIRMED extension off for an epoch (ADR-023 rule 4).
+  log(
+    bookFreshnessBasisOf(config) === "CONNECTION_CONFIRMED"
+      ? `book freshness: CONNECTION_CONFIRMED; a market-less incident from feed ` +
+          `${JSON.stringify(marketChannelFeedIdOf(config))} (or from no feed) taints its gateway epoch — it must ` +
+          "be the data gateway's polymarket.feedId"
+      : "book freshness: LAST_CHANGE",
+  );
 
   // The simulated venue, built by the core's ONE venue builder (`BACKTEST-2`,
   // ADR-022 D5) — the construction that used to stand here, moved, so the
@@ -989,6 +1006,17 @@ export async function assembleDurableTrader(
         "point a control API's traderHealth.http at this URL",
     );
   }
+  // `C1-HALTS` (HALT-PAGES): the run has started — every refusal above has
+  // passed — and it is a new run of each instance (BOOT-1), so it supersedes
+  // their earlier infrastructure halt rows. Never refuses the start.
+  await resolveSupersededHalts(
+    database,
+    [...config.instances, ...(config.seriesInstances ?? [])].map((instance) => ({
+      instanceId: instance.instanceId,
+      runId: instance.runId,
+    })),
+    log,
+  );
   return { ok: true, trader: created.trader, store, healthServer };
 }
 

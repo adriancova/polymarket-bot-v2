@@ -108,7 +108,7 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 import { computeFeatureSnapshot } from "@polymarket-bot/features";
-import { executablePrice } from "@polymarket-bot/order-book";
+import { executablePrice, type BookIngestMeta, type OrderBookRefusal } from "@polymarket-bot/order-book";
 import type { Intent } from "@polymarket-bot/domain";
 import type {
   EvaluationInput,
@@ -153,6 +153,7 @@ import {
   type BookFreshnessBasis,
   type ConfirmedInstant,
 } from "./book-freshness.js";
+import { classifyBookRefusal, type BookRefusalCounts } from "./book-refusals.js";
 import {
   EvaluationCadenceClock,
   PAPER_EVALUATION_CADENCE,
@@ -164,6 +165,7 @@ import { CancelLedger } from "./cancels.js";
 import {
   bookFreshnessBasisOf,
   bookFreshnessCeilingMsOf,
+  marketChannelFeedIdOf,
   type InstanceConfig,
   type MarketConfig,
   type TraderConfig,
@@ -714,6 +716,8 @@ export class CoreLoop {
   readonly #freshnessBasis: BookFreshnessBasis;
   /** ADR-023 D2 rule 6: the per-book ceiling on the last-change age (r1, X1). */
   readonly #freshnessCeilingMs: number | undefined;
+  /** `C1-HALTS` (TAINT): the feed whose market-less incidents taint an epoch (rule 4). */
+  readonly #marketChannelFeedId: string;
   readonly #liveness = new DeliverySessionLiveness();
   /**
    * `THROUGHPUT-1c` r8 (R8-H1, ADR-023 D2.4): every consumed event reaches the
@@ -972,6 +976,7 @@ export class CoreLoop {
     this.#lastInstant = options.clock.now();
     this.#freshnessBasis = bookFreshnessBasisOf(options.config);
     this.#freshnessCeilingMs = bookFreshnessCeilingMsOf(options.config);
+    this.#marketChannelFeedId = marketChannelFeedIdOf(options.config);
     this.#reference = new ReferenceState({
       windowMs: options.config.features.tradeWindowMs,
       maximumPoints: 512,
@@ -1151,6 +1156,23 @@ export class CoreLoop {
 
   queueMetrics(): readonly QueueMetrics[] {
     return Object.freeze([this.#queue.metrics(this.#lastEpochMs)]);
+  }
+
+  /**
+   * `C1-HALTS` (BOOK-WAITS): each configured market's book-refusal counts and
+   * the books waiting for a snapshot, keyed by market id in sorted order.
+   * Kept OFF the health snapshot: the control API's health door is a strict
+   * schema that refuses any field it does not know, so a field added there
+   * without that door would blank the trader's whole report. The trader logs
+   * this at its stop beside the health line.
+   */
+  bookRefusals(): Readonly<Record<string, BookRefusalCounts>> {
+    const out: Record<string, BookRefusalCounts> = Object.create(null) as Record<string, BookRefusalCounts>;
+    for (const marketId of [...this.#options.markets.keys()].sort()) {
+      const market = this.#options.markets.get(marketId);
+      if (market !== undefined) out[marketId] = market.bookRefusals();
+    }
+    return Object.freeze(out);
   }
 
   /**
@@ -1414,8 +1436,7 @@ export class CoreLoop {
       return;
     }
 
-    const affected = affectedMarketIds(envelope.payload);
-    const known = affected.filter((marketId) => this.#options.markets.has(marketId));
+    const known = this.#marketsNamedBy(envelope);
     // `CADENCE-1` (ADR-026 D3.2): this event is the frame's last APPLIED event,
     // so it is the source of every carried-over or heartbeat evaluation its
     // close runs — even though it owes no configured market one.
@@ -1541,8 +1562,7 @@ export class CoreLoop {
       return;
     }
 
-    const affected = affectedMarketIds(envelope.payload);
-    const known = affected.filter((marketId) => this.#options.markets.has(marketId));
+    const known = this.#marketsNamedBy(envelope);
     if (known.length === 0) return;
 
     this.#sweepCancels(instant, epochMs);
@@ -2050,7 +2070,7 @@ export class CoreLoop {
    * releases a terminal order's reservation, allocator commitment and
    * time-in-force BEFORE its halt gate, so they come back at this event's
    * harvest; the view itself is suppressed — not an evaluation — and the order
-   * is retired after the halt is released, as for every halt (R1).
+   * is never retired in this run, which the halt ends (`C1-HALTS`).
    */
   #haltOnVenueObservation(
     door: "observe" | "observeTrade",
@@ -2185,29 +2205,13 @@ export class CoreLoop {
       }
       case "BookSnapshot": {
         const applied = market.books.applySnapshot({ payload: envelope.payload, meta });
-        if (!applied.applied) {
-          this.#options.halts.halt(
-            { kind: "MARKET", marketId: market.config.marketId },
-            "BOOK_DESYNCHRONIZED",
-            `${applied.refusal.code}: ${applied.refusal.detail}`,
-            instant,
-          );
-          return undefined;
-        }
+        if (!applied.applied) return this.#bookRefused(market, envelope.payload, meta, applied.refusal, instant);
         this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
       case "BookLevelChanged": {
         const applied = market.books.applyLevelChange({ payload: envelope.payload, meta });
-        if (!applied.applied) {
-          this.#options.halts.halt(
-            { kind: "MARKET", marketId: market.config.marketId },
-            "BOOK_DESYNCHRONIZED",
-            `${applied.refusal.code}: ${applied.refusal.detail}`,
-            instant,
-          );
-          return undefined;
-        }
+        if (!applied.applied) return this.#bookRefused(market, envelope.payload, meta, applied.refusal, instant);
         this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
@@ -2276,6 +2280,60 @@ export class CoreLoop {
       default:
         return undefined;
     }
+  }
+
+  /**
+   * The configured markets one event names (step 2): its `internalMarketId`,
+   * or an incident's `affectedMarketIds`. `C1-HALTS` (DQ-CLOSE): a
+   * `DataQualityIncidentClosed` names no market — its frozen contract carries
+   * only the `incidentId` — so it reaches every configured market whose active
+   * set holds that id. Until then the close reached none, and one transient
+   * lifecycle-poll failure paused its market for the market's life.
+   */
+  #marketsNamedBy(envelope: EventEnvelopeOf): readonly string[] {
+    if (envelope.eventType === "DataQualityIncidentClosed") {
+      const incidentId = readString(envelope.payload, "incidentId");
+      if (incidentId === undefined) return Object.freeze([]);
+      return Object.freeze(
+        [...this.#options.markets]
+          .filter(([, market]) => market.holdsIncident(incidentId))
+          .map(([marketId]) => marketId),
+      );
+    }
+    return affectedMarketIds(envelope.payload).filter((marketId) => this.#options.markets.has(marketId));
+  }
+
+  /**
+   * `C1-HALTS` (BOOK-WAITS): one refused book update, by its class
+   * (`book-refusals.ts`). Only a `FAULT` — a contract or programming fault —
+   * halts (and every halt ends the run). A `BENIGN` drop is counted; a
+   * `DIVERGENCE` makes the book wait for its next snapshot
+   * ({@link MarketState.noteBookRefusal}). Either way no callback fires: the
+   * book did not change.
+   */
+  #bookRefused(
+    market: MarketState,
+    payload: unknown,
+    meta: BookIngestMeta,
+    refusal: OrderBookRefusal,
+    instant: string,
+  ): undefined {
+    const refusalClass = classifyBookRefusal(refusal.code);
+    // The book routed the payload to one of this market's two tokens before
+    // any non-FAULT refusal, so the outcome is known; were it ever not, the
+    // refusal is treated as the fault it would then be.
+    const outcome = market.outcomeOfToken(readString(payload, "tokenId"));
+    if (refusalClass === "FAULT" || outcome === undefined) {
+      this.#options.halts.halt(
+        { kind: "MARKET", marketId: market.config.marketId },
+        "BOOK_DESYNCHRONIZED",
+        `${refusal.code}: ${refusal.detail}`,
+        instant,
+      );
+      return undefined;
+    }
+    market.noteBookRefusal(refusalClass, outcome, meta);
+    return undefined;
   }
 
   /**
@@ -2832,7 +2890,11 @@ export class CoreLoop {
       // ADR-031 R4: from the later of the event instant and the process
       // instant (the event instant for a CANCEL, or an unreadable reading).
       secondsToClose: this.#secondsToClose(marketConfig, admission?.closeFromEpochMs ?? input.epochMs),
-      bookSynchronized: input.market.bookFor(input.instance.direction).baseline() !== undefined,
+      // `C1-HALTS` r1 (L1): the book the intent is placed on and priced from
+      // (`#economicsFor` reads `intent.direction`'s book). A complement-leg
+      // intent trades the configured direction's complement, so judging the
+      // configured book would let it through while ITS book waits.
+      bookSynchronized: input.market.bookFor(placedDirection(input.intent, input.instance.direction)).baseline() !== undefined,
       venueBookAgeMs: bookAgeMs,
       // ADR-031 R3/R5: the feature snapshot's age at admission is the lag;
       // `undefined` (an unreadable reading) is OMITTED, so check 7 refuses an
@@ -2866,11 +2928,9 @@ export class CoreLoop {
       evaluation.recommendations.map((recommendation) => recommendation.action),
     );
     if (!evaluation.approved) {
-      // THE RISK-SEAM CAVEAT, COUNTED AND NOT COMPENSATED FOR. `WP-220`'s
-      // accepted residual makes every exit this strategy emits an ENTRY at the
-      // risk seam, so a protective reduction can be refused here. The loop
-      // records that fact — with the reason codes that produced it — and does
-      // nothing else. It does not re-tag, resize, retry or relax.
+      // A REFUSAL IS COUNTED, NOT COMPENSATED FOR: a refused protective exit
+      // is counted with the reason codes that refused it (`refusedExits`), and
+      // the loop does nothing else. It does not re-tag, resize, retry or relax.
       this.#options.health.countRiskRefusal(
         evaluation.refusals.map((refusal) => refusal.code),
         isProtectiveExitIntent(input.intent),
@@ -3389,8 +3449,8 @@ export class CoreLoop {
    * WHAT THIS DOES NOT TOUCH. Ownership (`#ownBookedOrders` ran first) and the
    * release rules: a booked order keeps its reservation, allocator commitment
    * and time-in-force until the harvest that sees it terminal (ADR-006 §9), as
-   * every order does; a halted market's deliveries are suppressed and its
-   * terminal orders retired after the halt is released, as for every halt.
+   * every order does; a halted market's deliveries are suppressed, as for
+   * every halt, and the halt ends the run (`C1-HALTS`).
    */
   #watchBasket(plan: ExecutionPlan, result: ExecutionResult, instant: string): void {
     if (plan.planKind !== "BASKET") return;
@@ -5509,8 +5569,10 @@ export class CoreLoop {
   /**
    * `THROUGHPUT-1c` (ADR-023 D2): offers one consumed event to the
    * delivery-session table, and applies rule 4 — a data-quality incident that
-   * names NO market taints its gateway epoch, every session of it, for good.
-   * Nothing is recorded under `LAST_CHANGE`, which reads none of it.
+   * names NO market taints its gateway epoch, every session of it, for good,
+   * when it can speak for the market channel's delivery ({@link taintsEpoch},
+   * `C1-HALTS`). Nothing is recorded under `LAST_CHANGE`, which reads none of
+   * it.
    *
    * r8 (R8-H1): the event goes through the frame gate, never straight to the
    * table. Its own confirmation is HELD until a later event of its epoch from
@@ -5521,10 +5583,7 @@ export class CoreLoop {
   #observeDeliverySession(envelope: EventEnvelopeOf, iso: string, epochMs: number): void {
     if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return;
     this.#frameGate.offer(envelope, { iso, epochMs });
-    if (
-      envelope.eventType === "DataQualityIncidentOpened" &&
-      affectedMarketIds(envelope.payload).length === 0
-    ) {
+    if (taintsEpoch(envelope, this.#marketChannelFeedId)) {
       this.#liveness.taintGatewayEpoch(envelope.gatewayEpoch);
     }
   }
@@ -5774,6 +5833,37 @@ function readString(payload: unknown, key: string): string | undefined {
 }
 
 /**
+ * `C1-HALTS` (TAINT; the user's ruling of 2026-10-08, NARROW — reversing the
+ * coarse interim ruling of 2026-10-02; ADR-023's dated note): whether one
+ * consumed event taints its gateway epoch (rule 4). Only a data-quality
+ * incident that names NO market, AND can speak for the Polymarket market
+ * channel's delivery:
+ *
+ * - its `feedId` is the market channel's (`marketChannelFeedId`), or it has
+ *   none — a gateway-wide fault (a frame split, a refused envelope, a
+ *   publication halt, a WAL write fault) carries no feed;
+ * - its source is not a reference venue (`binance`, `coinbase`): those
+ *   sockets cannot drop a Polymarket book frame, and their start and
+ *   reconnect notices arrived within seconds of every recorded start (8 of 8
+ *   H1 runs), which switched the rule off for the whole epoch;
+ * - its reason is not `UNASSIGNED_PARAMETER_VERSION`: the venue's routine
+ *   second, identical `tick_size_change` of a pair, which the directory
+ *   refuses as a no-op (6 of 6 full H1 runs). It reports no lost frame.
+ *
+ * Every other market-channel code still taints, `UNKNOWN_EVENT_TYPE`
+ * included. An internal incident whose `feedId` names a REFERENCE feed (a
+ * Binance stall, a Coinbase WAL refusal) does not. The taint is never lifted.
+ */
+function taintsEpoch(envelope: EventEnvelopeOf, marketChannelFeedId: string): boolean {
+  if (envelope.eventType !== "DataQualityIncidentOpened") return false;
+  if (affectedMarketIds(envelope.payload).length > 0) return false;
+  if (envelope.source === "binance" || envelope.source === "coinbase") return false;
+  if (readString(envelope.payload, "reasonCode") === "UNASSIGNED_PARAMETER_VERSION") return false;
+  const feedId = readString(envelope.payload, "feedId");
+  return feedId === undefined || feedId === marketChannelFeedId;
+}
+
+/**
  * Every market an event affects.
  *
  * Most §7.4 events name exactly one (`internalMarketId`). A data-quality
@@ -5823,6 +5913,15 @@ function affectedMarketIds(payload: unknown): readonly string[] {
  * `CAPITAL_LIVE_OWNERSHIP_CONFLICT` rather than a book of its own.
  */
 const SHARED_BOOK_ACCOUNTING_MODE = "LIVE" as const;
+
+/**
+ * `C1-HALTS` r1 (L1): the outcome whose book a placement trades: a POSITION
+ * intent's own `direction` (a complement-leg entry trades the configured
+ * direction's complement), otherwise the instance's configured direction.
+ */
+function placedDirection(intent: Intent, configured: "YES" | "NO"): "YES" | "NO" {
+  return intent.type === "POSITION" ? intent.direction : configured;
+}
 
 function intentIdOf(intent: Intent): string {
   return "intentId" in intent && typeof intent.intentId === "string" ? intent.intentId : "";

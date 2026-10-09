@@ -115,7 +115,7 @@ async function traderHalts(): Promise<void> {
     pool: database().pool,
   });
   const rows = haltIncidentRows(
-    [{ scope: { kind: "GLOBAL" }, code: "TRANSPORT_UNAVAILABLE", detail: "redis did not answer", at: "2026-10-04T00:00:01.000Z", action: "FULL_HALT" }],
+    [{ scope: { kind: "GLOBAL" }, code: "TRANSPORT_UNAVAILABLE", detail: "redis did not answer", at: "2026-10-04T00:00:01.000Z" }],
     { accountRef: "paper-account", instanceIds: [chain?.instanceId ?? ""] },
   );
   expect(await store.recordHalts(rows, 5_000)).toEqual({ status: "written", rows: 1 });
@@ -216,10 +216,11 @@ describe("the SHIPPED bundle reads an open trader halt from a real PostgreSQL (C
         severity: "PAGE",
         environment: "PAPER",
         failureClass: "TRANSPORT_UNAVAILABLE",
-        action: "FULL_HALT",
         detail: "redis did not answer",
         irregularities: [],
       });
+      // C1-HALTS: no action is shown (the trader writes it NULL).
+      expect(open.listed?.[0] !== undefined && "action" in open.listed[0]).toBe(false);
       const metrics = await get(running.port, "/v1/metrics");
       served.push(metrics.body);
       expect(metrics.status).toBe(200);

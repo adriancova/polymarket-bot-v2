@@ -252,11 +252,24 @@ const FeatureConfigSchema = z.strictObject({
 export const MAXIMUM_LAST_CHANGE_AGE_CAP_MS = 600_000;
 const LastChangeCeilingMs = z.number().int().positive().max(MAXIMUM_LAST_CHANGE_AGE_CAP_MS);
 
+/**
+ * `C1-HALTS` (TAINT; the user's ruling of 2026-10-08, ADR-023's dated note):
+ * the gateway `feedId` of the Polymarket MARKET CHANNEL, whose market-less
+ * incidents taint a gateway epoch (rule 4). Optional, and absence means
+ * {@link DEFAULT_MARKET_CHANNEL_FEED_ID} — the id both example configurations
+ * use, pinned equal by a repository test — so no operator must set a new knob
+ * to keep the protection. A WRONG value is the unsafe direction (the market
+ * channel's own incidents would stop tainting), which is why it defaults
+ * rather than being required, and why the trader logs it at start.
+ */
+export const DEFAULT_MARKET_CHANNEL_FEED_ID = "polymarket-market";
+
 const BookFreshnessConfigSchema = z.discriminatedUnion("basis", [
   z.strictObject({ basis: z.literal(BOOK_FRESHNESS_BASES[0]) }),
   z.strictObject({
     basis: z.literal(BOOK_FRESHNESS_BASES[1]),
     maximumLastChangeAgeMs: LastChangeCeilingMs,
+    marketChannelFeedId: CodeString.optional(),
   }),
 ]);
 
@@ -760,6 +773,21 @@ export function bookFreshnessCeilingMsOf(config: TraderConfig): number | undefin
   if (block === undefined || block.basis !== "CONNECTION_CONFIRMED") return undefined;
   if (!Object.hasOwn(block, "maximumLastChangeAgeMs")) return undefined;
   return block.maximumLastChangeAgeMs;
+}
+
+/**
+ * `C1-HALTS` (TAINT): the market-channel feed id rule 4 reads, as an OWN
+ * property; {@link DEFAULT_MARKET_CHANNEL_FEED_ID} when absent (and under
+ * `LAST_CHANGE`, which reads no taint).
+ */
+export function marketChannelFeedIdOf(config: TraderConfig): string {
+  if (!Object.hasOwn(config, "bookFreshness")) return DEFAULT_MARKET_CHANNEL_FEED_ID;
+  const block = config.bookFreshness;
+  if (block === undefined || block.basis !== "CONNECTION_CONFIRMED") return DEFAULT_MARKET_CHANNEL_FEED_ID;
+  if (!Object.hasOwn(block, "marketChannelFeedId") || block.marketChannelFeedId === undefined) {
+    return DEFAULT_MARKET_CHANNEL_FEED_ID;
+  }
+  return block.marketChannelFeedId;
 }
 
 /**

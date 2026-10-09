@@ -398,9 +398,46 @@ export class GatewayDispatcher {
     );
   }
 
-  /** Closes the registry key so a recurrence opens a fresh incident. */
+  /**
+   * Closes the registry key so a recurrence opens a fresh incident, and —
+   * `C1-HALTS` (DQ-CLOSE) — when that closed an OPEN incident, publishes its
+   * `DataQualityIncidentClosed` through the ordinary funnel. Until then no
+   * producer published a close, so a consumer's active set only grew: the
+   * trader paused a market for its life on one transient poll failure. A key
+   * that was not open publishes nothing, so a caller may call this on every
+   * success.
+   */
   markIncidentClosed(scope: string, reasonCode: string): void {
-    this.#incidents.markClosed(scope, reasonCode);
+    const incidentId = this.#incidents.markClosed(scope, reasonCode);
+    if (incidentId === undefined) return;
+    void this.dispatch(
+      this.#incidents.closedDraft({ incidentId, scope, reasonCode, atMs: this.#clock.nowMs() }),
+    );
+  }
+
+  /**
+   * `C1-HALTS` r1 (L4): replaces the OPEN incident for a key with a fresh one
+   * (a new id and detail), publishing the new incident's open BEFORE the old
+   * one's close, so a consumer never sees the key's condition with no active
+   * incident between them. Closing first, then opening, left that gap: the
+   * trader un-paused the market at the close. With no open incident for the
+   * key this is {@link openIncident}.
+   */
+  replaceIncident(
+    input: Parameters<GatewayDispatcher["openIncident"]>[0],
+    buildDraft?: (incidentId: string) => EnvelopeDraft,
+  ): void {
+    const previous = this.#incidents.markClosed(input.scope, input.reasonCode);
+    this.openIncident(input, buildDraft);
+    if (previous === undefined) return;
+    void this.dispatch(
+      this.#incidents.closedDraft({
+        incidentId: previous,
+        scope: input.scope,
+        reasonCode: input.reasonCode,
+        atMs: this.#clock.nowMs(),
+      }),
+    );
   }
 
   get incidents(): IncidentRegistry {

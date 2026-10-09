@@ -15,8 +15,8 @@
  *
  * 1. R1 — a terminal order is delivered until ONE evaluated delivery, then
  *    retired: the golden-shaped run; an immediate order; a halted instance
- *    (suppressed deliveries do not count; after the halt is released the view
- *    is delivered and evaluated); a PAUSED runtime (a REAL pause through the
+ *    (suppressed deliveries do not count; `C1-HALTS`: no release exists, so
+ *    the view stays undelivered and the run ends); a PAUSED runtime (a REAL pause through the
  *    watchdog, and the runtime's refusal answer); `ctx.orders()` excludes
  *    retired orders.
  * 2. Settlement needs (a)-(d): a booked-shares mismatch is counted once and
@@ -892,7 +892,7 @@ describe("R1 — a terminal order is delivered until ONE evaluated delivery, the
     expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, entry.simulatedOrderId);
   });
 
-  it("a HALTED instance: suppressed deliveries do not count; after release the view is delivered, evaluated, then retired", async () => {
+  it("a HALTED instance: suppressed deliveries do not count, so the view is neither retired nor settled (C1-HALTS: the run then ends)", async () => {
     const parts = assemble();
     const scope = { kind: "STRATEGY_INSTANCE" as const, instanceId: INSTANCE_ID };
     // Latch the halt the moment the entry has been submitted: the entry fills
@@ -913,24 +913,8 @@ describe("R1 — a terminal order is delivered until ONE evaluated delivery, the
     expect(loop.health().loop.deliveriesSuppressedByHalt).toBeGreaterThanOrEqual(2);
     expect(loop.retainedOrderState()).toMatchObject({ owners: 1, retiredUnsettled: 0, tombstones: 0 });
     expect(loop.health().seams.orders.settled).toBe(0);
-
-    // Release the halt against evidence, then process the next event.
-    expect(
-      parts.trader.halts.release(scope, {
-        authoritativeSnapshotApplied: true,
-        reason: "TRDR-4 test: the instance's state was re-established",
-      }),
-    ).toBe(true);
-    await drive(parts, 7, 7);
-    const delivered = deliveriesOf(parts, entry.simulatedOrderId);
-    expect(delivered.map((d) => [d.orderStatus, d.outcome, d.event])).toEqual([["FILLED", "DECIDED", 7]]);
-    // The retiring evaluation still carried the order in ctx.orders()…
-    expect(delivered[0]?.ctxOrderIds).toContain(entry.simulatedOrderId);
-    // …and from then on it is retired and settled.
-    expect(loop.health().seams.orders.settled).toBeGreaterThanOrEqual(1);
-    await drive(parts, 8, 8);
-    expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, entry.simulatedOrderId);
-    expect(deliveriesOf(parts, entry.simulatedOrderId)).toHaveLength(1);
+    // C1-HALTS: no release exists — the run ends on the halt, so the order
+    // stays unsettled for the rest of this process.
   });
 
   it("a PAUSED runtime (a REAL pause, through the watchdog): every refused offer leaves the order deliverable, never retired", async () => {
@@ -1124,7 +1108,6 @@ describe("an ownerless fill is never skipped — UNATTRIBUTED, halted, counted (
     expect(health.accounting.unattributedActivity).toBeGreaterThan(0);
     const halt = health.halts.find((record) => record.code === "UNATTRIBUTED_ACTIVITY");
     expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
-    expect(halt?.action).toBe("RECONCILE_ACCOUNT");
     expect(halt?.detail).toContain(`instance ${INSTANCE_ID} as the PROBABLE owner`);
     expect(halt?.detail).toContain("NOT attributed");
     // The ledger holds an ACTUAL_ARRIVAL that requires the halt, and the store
@@ -1474,9 +1457,7 @@ describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY
 
     // The failure is not silent: the loop read observe()'s answer and halted.
     const halts = loop.health().halts;
-    expect(halts.map((halt) => `${halt.scope.kind} ${halt.code} ${halt.action}`)).toEqual([
-      "GLOBAL VENUE_OBSERVATION_FAILED RECONCILE_ACCOUNT",
-    ]);
+    expect(halts.map((halt) => `${halt.scope.kind} ${halt.code}`)).toEqual(["GLOBAL VENUE_OBSERVATION_FAILED"]);
     expect(halts[0]?.detail).toContain("SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
     expect(halts[0]?.detail).toContain(entry.simulatedOrderId);
 
@@ -1840,30 +1821,8 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
       orders: { retained: 0, maximumRetained: 1, evicted: 0 },
     });
     for (const id of ids) expect(parts.venue.orderById(id)?.state).toBe("FILLED");
-
-    // Release the instance: each terminal view is delivered, evaluated,
-    // retired and settled — and only THEN acknowledged, in venue order.
-    expect(
-      parts.trader.halts.release(scope, {
-        authoritativeSnapshotApplied: true,
-        reason: "SIM-2 test: the instance's state was re-established",
-      }),
-    ).toBe(true);
-    await driveOne(parts, quietEvent(7, "2026-05-01T09:00:04.000Z"), 7);
-    for (const id of ids) {
-      expect(deliveriesOf(parts, id).map((d) => [d.orderStatus, d.outcome, d.event])).toEqual([["FILLED", "DECIDED", 7]]);
-      expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, id);
-    }
-    expect(loop.health().halts).toEqual([]);
-    expect(loop.health().seams.orders.settled).toBe(2);
-    expect(parts.venue.acknowledged).toEqual(ids);
-    // Now — and not before — the venue's bound applies: one kept, one evicted,
-    // the evicted one tombstoned.
-    expect(parts.venue.inner.retention()).toMatchObject({
-      awaitingAcknowledgment: 0,
-      orders: { retained: 1, maximumRetained: 1, evicted: 1 },
-      tombstones: { retained: 1, evicted: 0 },
-    });
+    // C1-HALTS: no release exists — the run ends on the halt, and the venue
+    // keeps answering for both slices until it does.
   });
 
   it("SIM2-R1-4: a LOST answer's order, once the venue has SHOWN it, is held by its venue id — its later disappearance HALTS, and the hold is kept", async () => {
@@ -1929,7 +1888,6 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
     const health = loop.health();
     const halt = health.halts.find((record) => record.scope.kind === "GLOBAL");
     expect(halt?.code).toBe("VENUE_OBSERVATION_FAILED");
-    expect(halt?.action).toBe("RECONCILE_ACCOUNT");
     expect(halt?.detail).toContain(`order ${takeProfit.simulatedOrderId}, which instance ${INSTANCE_ID} owns`);
     expect(halt?.detail).toContain("which this process has not acknowledged: evicted from its bounded history regardless, or never held");
     // Still owned, still reserved: a miss never releases anything.

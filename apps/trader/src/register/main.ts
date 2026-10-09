@@ -54,10 +54,9 @@
  *
  * It does NOT verify a `gammaMarketId` (`UNIV4-R1`): nothing in this repository
  * can, and the gateway's `lifecycle` block is not its input. It prints the
- * operator's reminder instead. It does not register a second run for an
- * existing instance, nor a second instance on a registered market; both are
- * refused as duplicates (the follow-ups are recorded in `REGISTER-1`'s
- * handoff).
+ * operator's reminder instead. It does not register a second instance on a
+ * registered market (refused as a duplicate). A second run for an existing
+ * instance is `--new-run`'s (`C1-HALTS`, `new-run.ts`).
  *
  * PAPER only: it registers `PAPER` rows and nothing else, holds no credential,
  * and contacts no venue.
@@ -75,9 +74,11 @@ import {
   asksForHelp,
   parseRegisterArguments,
   REGISTRABLE_LIFECYCLE_STATES,
+  type NewRunArguments,
   type RegisterArguments,
   type SeriesRegisterArguments,
 } from "./arguments.js";
+import { mintNewRun, readNewRunDocument } from "./new-run.js";
 import { OneTransactionViolation, openOneTransaction, type OneTransaction } from "./one-transaction.js";
 import {
   registerRows,
@@ -136,6 +137,8 @@ export const USAGE = `usage: register --template <file> --out <file>
                 --code-commit <commit> --created-by <who>
        register --series --template <file> --out <file>
                 --instance-name <name> --code-commit <commit> --created-by <who>
+       register --new-run <instanceId> --template <completed file> --out <file>
+                --code-commit <commit>
        register --help
        (pnpm --filter @polymarket-bot/trader run register -- <flags>; one
        leading "--" is ignored)
@@ -221,9 +224,15 @@ pin of the series, which the trader compares at every start. The six market
 flags are refused with --series.
 
 Running it again is REFUSED: a registered conditionId, token id or PAPER
-instance name is a duplicate, and nothing is written (exit 78). A new run for
-an existing instance is not this command's (BOOT-1: startRun, then point the
-document's runId at it).
+instance name is a duplicate, and nothing is written (exit 78).
+
+With --new-run <instanceId> (C1-HALTS): a NEW strategy.runs row for an instance
+a completed document (--template; one this command wrote) already names, and
+the document again with that instance's runId replaced. Every start needs a
+new run (BOOT-1 refuses a run that holds decisions, and every halt ends the
+run). The market, instance and config rows are REUSED only if the trader's own
+startup registration check accepts them with the new run, inside the one
+transaction; otherwise nothing is written. One instance per call.
 
 Output:
   Progress and refusals on stderr. On success, ONE JSON line on stdout with the
@@ -322,6 +331,9 @@ async function run(ports: RegisterPorts): Promise<number> {
     log(`REFUSING TO REGISTER: REGISTER_OUTPUT_NOT_CREATABLE: ${outProblem}; nothing was registered`);
     return REGISTER_EXIT_CODES.outputNotCreatable;
   }
+
+  // `C1-HALTS` (NEW-RUN): a new run of a registered instance (`new-run.ts`).
+  if (args.newRun !== undefined) return await runNewRun(ports, args, databaseUrl, out);
 
   // --- 4. the template, through the trader's own doors, in memory ------------
   let text: string;
@@ -424,7 +436,7 @@ async function run(ports: RegisterPorts): Promise<number> {
     try {
       await transaction.commit();
     } catch (cause) {
-      const failure = commitFailed(log, cause, plan.plan, ids.runId, out);
+      const failure = commitFailed(log, cause, plan.plan.market?.conditionId, ids.runId, out);
       keepOutput = failure.outcomeUnknown;
       return failure.code;
     }
@@ -456,6 +468,128 @@ async function run(ports: RegisterPorts): Promise<number> {
               "were not committed, and the trader refuses such a document as " +
               "TRADER_REGISTRATION_MISSING)",
           );
+        }
+      }
+    }
+    try {
+      await transaction.close();
+    } catch (cause) {
+      log(`  (closing the database connection failed: ${describe(cause)})`);
+    }
+  }
+}
+
+/**
+ * `C1-HALTS` (NEW-RUN): `register --new-run <instanceId>`, steps 4-7 for a
+ * completed document (`new-run.ts`). The same guarantees as a registration:
+ * ONE transaction, the trader's doors and dry assembly before and after, the
+ * document written with `O_EXCL` before the one COMMIT, and the same exits.
+ */
+async function runNewRun(
+  ports: RegisterPorts,
+  args: NewRunArguments,
+  databaseUrl: string,
+  out: string,
+): Promise<number> {
+  const { log } = ports;
+  let text: string;
+  try {
+    text = await readFile(args.template, "utf8");
+  } catch (cause) {
+    log(
+      `REFUSING TO REGISTER: REGISTER_TEMPLATE_UNREADABLE: ${args.template} could not be read ` +
+        `(${describe(cause)}); nothing was registered`,
+    );
+    return REGISTER_EXIT_CODES.refused;
+  }
+  const read = readNewRunDocument(text, args.newRun);
+  if (!read.ok) return refusedTemplate(log, read.refusal);
+  const before = dryAssemble(read.value.document, ports.env, ports.nowMs);
+  if (!before.ok) return refusedTemplate(log, before.refusal);
+  log(
+    `document: OK — ${args.template}: instance ${read.value.instanceId}, now naming run ${read.value.previousRunId}; ` +
+      "the trader's configuration door and its composition root accepted it in memory",
+  );
+
+  let transaction: OneTransaction;
+  try {
+    transaction = await openOneTransaction({ connectionString: databaseUrl, applicationName: APPLICATION_NAME });
+  } catch (cause) {
+    log(
+      `REFUSING TO REGISTER: REGISTER_DATABASE_UNAVAILABLE: the database named by ${DATABASE_URL} ` +
+        `could not be reached (${describe(cause)}); nothing was registered`,
+    );
+    return REGISTER_EXIT_CODES.databaseUnavailable;
+  }
+  log(`database: connected (${DATABASE_URL}; credentials not printed); one transaction open`);
+
+  let committed = false;
+  let written = false;
+  let keepOutput = false;
+  try {
+    const minted = await mintNewRun(transaction.db, read.value, args.codeCommit, log);
+    if (!minted.ok) {
+      log(`REFUSING TO REGISTER: ${minted.refusal.code}: ${minted.refusal.detail}`);
+      for (const issue of minted.refusal.issues) log(`  ${issue}`);
+      return REGISTER_EXIT_CODES.refused;
+    }
+    const recheck = dryAssemble(minted.document, ports.env, ports.nowMs);
+    if (!recheck.ok) {
+      log(
+        `REGISTER_FAILED_UNEXPECTEDLY: the document with the new run was refused by the trader's own doors ` +
+          `(${recheck.refusal.code}: ${recheck.refusal.detail}) although the input passed them; nothing was committed`,
+      );
+      for (const issue of recheck.refusal.issues) log(`  ${issue}`);
+      return REGISTER_EXIT_CODES.internalFailure;
+    }
+    const writeProblem = await writeExclusive(out, `${JSON.stringify(minted.document, null, 2)}\n`);
+    if (writeProblem !== undefined) {
+      log(`REFUSING TO REGISTER: REGISTER_OUTPUT_NOT_CREATABLE: ${writeProblem}; nothing was committed`);
+      return REGISTER_EXIT_CODES.outputNotCreatable;
+    }
+    written = true;
+    try {
+      await transaction.commit();
+    } catch (cause) {
+      const failure = commitFailed(log, cause, undefined, minted.runId, out);
+      keepOutput = failure.outcomeUnknown;
+      return failure.code;
+    }
+    committed = true;
+    try {
+      log(`committed: strategy.runs ${minted.runId} for instance ${read.value.instanceId} — in one transaction`);
+      log(`completed trader configuration written to ${out} (start the trader with TRADER_CONFIG_PATH=${out})`);
+      ports.print(
+        `${JSON.stringify({
+          registered: true,
+          newRun: true,
+          instanceId: read.value.instanceId,
+          runId: minted.runId,
+          previousRunId: read.value.previousRunId,
+          completedDocument: out,
+        })}\n`,
+      );
+    } catch {
+      // Committed and written; the exit code says so.
+    }
+    return REGISTER_EXIT_CODES.registered;
+  } catch (cause) {
+    return writeFailed(log, cause);
+  } finally {
+    if (!committed) {
+      try {
+        await transaction.rollback();
+      } catch (cause) {
+        log(
+          `  (the rollback itself failed: ${describe(cause)}; PostgreSQL discards an uncommitted ` +
+            "transaction when its connection ends, which happens next)",
+        );
+      }
+      if (written && !keepOutput) {
+        try {
+          await rm(out, { force: true });
+        } catch (cause) {
+          log(`  (${out} could not be removed: ${describe(cause)}. Delete it: the run it names was not committed)`);
         }
       }
     }
@@ -743,7 +877,7 @@ function writeFailed(log: (line: string) => void, cause: unknown): number {
 function commitFailed(
   log: (line: string) => void,
   cause: unknown,
-  plan: RegistrationPlan,
+  conditionId: string | undefined,
   runId: string,
   out: string,
 ): { readonly code: number; readonly outcomeUnknown: boolean } {
@@ -767,7 +901,7 @@ function commitFailed(
       "start the trader on it (its registration check answers 'registration: OK' if they " +
       "landed, and refuses with TRADER_REGISTRATION_MISSING if not), or check whether " +
       `strategy.runs holds run_id ${runId}` +
-      (plan.market === undefined ? "" : ` (and catalog.markets condition_id ${JSON.stringify(plan.market.conditionId)})`) +
+      (conditionId === undefined ? "" : ` (and catalog.markets condition_id ${JSON.stringify(conditionId)})`) +
       ". If they landed, start from that document " +
       "and do NOT run this command again (it is refused as a duplicate); if not, nothing was " +
       "registered: delete that document and run the command again",
