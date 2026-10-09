@@ -193,7 +193,7 @@
       "id": 14,
       "type": "table",
       "title": "Kill switches engaged",
-      "description": "§14.1 kill switches latched through the control API, by scope and action. Engaging one is an operator act and is audited; so is releasing one, which additionally requires evidence.",
+      "description": "§14.1 kill switches latched through the control API, by scope and action. Engaging one is an operator act and is audited; so is releasing one, which additionally requires evidence. In PAPER this stays 0: no trader reads the control API, so it answers every engage 501 CONTROL_NOT_WIRED; stop a PAPER trader with Ctrl-C or SIGTERM.",
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 33 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [

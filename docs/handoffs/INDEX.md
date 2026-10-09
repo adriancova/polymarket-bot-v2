@@ -2,7 +2,7 @@
 
 One line per handoff in this directory, oldest first. "Added" is the date git first recorded the file. A Complete package's row here is its only status row: the brief, `IMPLEMENTATION_STATUS.md`, lists open packages only ([`README.md`](README.md) rules 1 and 10). A completed package with no handoff (`DEPS-1`) has a row that links its archived row; its "Added" is its merge date. Kinds: WP (a work package), FU (a follow-up to one), Governance, Audit, Round (a bounded round), Operational, Session.
 
-After a merge, add or update the handoff's single row here (see [`README.md`](README.md)).
+In the round's own branch, before the merge, add or update the handoff's single row here ([`README.md`](README.md) rule 10). From 2026-10-08 the Merge cell reads "merged via PR #N" with the candidate SHA; older rows give the merge SHA. `RESIDUALS.md` and `README.md` are not handoffs and have no row.
 
 | Added | Handoff | Package or round | Kind | Outcome | Merge | Size |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -166,3 +166,5 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-06 | [RECORDS-W3B.md](RECORDS-W3B.md) | `RECORDS-W3B`: completed packages live in the INDEX, not the brief | Records | Complete (2026-10-06) | `e1915c6` | 3 KB |
 | 2026-10-08 | [ADR-034.md](ADR-034.md) | `ADR-034`: pre-live order-lifecycle design (Accepted 2026-10-08) and the 2026-10-06 venue addendum | Governance | Complete (2026-10-08): the user confirmed D1's additions and ruled variant P share caps; implementation rounds `OMS-QTY`, `OMS-VENUE-TIME`, `TIF-COLLATERAL` | `e1b62c1` | 4 KB |
 | 2026-10-08 | [OMS-QTY.md](OMS-QTY.md) | `OMS-QTY`: one executable quantity on the 0.01 grid (ADR-034 R1, D2; `CO3-N1`) | Round | Complete (2026-10-08) | `9df10c7` | 4 KB |
+| 2026-10-08 | [V2-9.md](V2-9.md) | `V2-9`: Protocol V2 venue fixture catalogue (scanner cut down by COMPLEXITY-1) | WP | Complete (2026-10-08) | `636536a` | 3 KB |
+| 2026-10-08 | [COMPLEXITY-1.md](COMPLEXITY-1.md) | `COMPLEXITY-1`: complexity audit with fixes (proportionality); rounds C1-V29, C1-PROC, C1-HALTS, C1-RISK, C1-TIF, C1-UNIV, C1-OPS | Round | Running: C1-V29 merged with V2-9 (`636536a`); C1-PROC via PR #91 | — | 4 KB |

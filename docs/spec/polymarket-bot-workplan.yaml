@@ -16,6 +16,9 @@ protected_paths:
   - packages/domain/**
   - packages/decimal/**
   - db/migrations/**
+  # Exception (user ruling, 2026-10-08): a round granted to implement an ADR may
+  # append a dated, append-only "Note (<date>, <round>)" to it; a Decision-section
+  # change stays protected (docs/adr/README.md).
   - docs/adr/**
   - pnpm-lock.yaml
   - package.json

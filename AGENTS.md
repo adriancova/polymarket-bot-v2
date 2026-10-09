@@ -2,13 +2,13 @@
 
 Before planning, editing, or delegating:
 
-1. Read `docs/spec/polymarket-bot-orchestrator-handoff.md`.
-2. Read `docs/spec/polymarket-bot-workplan.yaml`.
+1. Read the sections of `docs/spec/polymarket-bot-orchestrator-handoff.md` that your package or decision cites. A session that writes a packet or ADR for a protected-area package (ambiguous submissions, duplicate orders, position sizing, reliable exits, persistence ordering, risk, halts) reads the handoff's invariant and OMS sections (§6 and §9.11) in full.
+2. Read the parts of `docs/spec/polymarket-bot-workplan.yaml` that your package or decision cites. A session that writes a packet or ADR for a protected-area package reads that package's work-plan row in full.
 3. Read `IMPLEMENTATION_STATUS.md`. It is a brief of current state: its history is archived, verbatim and frozen, under `docs/status-archive/`; per-package detail goes in the handoff (`docs/handoffs/README.md`), linked from the package's one-line row.
 4. Inspect the current Git status and recent commits.
 5. When orchestrating multi-package execution, also read
    `docs/spec/polymarket-bot-agent-orchestration-runbook.md` (process authority
-   for the per-package lifecycle and wave gates).
+   for the per-package lifecycle and wave gates), starting with §3, "The current loop".
 
 ## Authority
 

@@ -42,11 +42,15 @@
  *    admissions until a resolution is handled; the cap incident says how many
  *    live windows await theirs.
  *
- *    **A resolution never observed** — the gateway was down, asleep or
- *    disconnected at the resolution instant, and the market channel is not
- *    documented to replay it — would hold its window's slot for good.
- *    `ROLLOVER-1` r3 (R3-FABLE-01): the reviewed recovery is the OPERATOR'S
- *    RETIREMENT. A `seriesAdmission.operatorRetirements` entry names the
+ *    **A resolution the market channel never delivered** — the gateway was
+ *    down, asleep or disconnected at the resolution instant, and the channel
+ *    is not documented to replay it — does not hold the slot for good: since
+ *    `V2-3` the window's `/v2/resolutions` row is read every cycle, with no
+ *    time limit (step 8), and the first read that finds it resolved
+ *    publishes the resolution and frees the slot. `ROLLOVER-1` r3
+ *    (R3-FABLE-01): the OPERATOR'S RETIREMENT is the recovery only when that
+ *    row path has ENDED (a refused row) or its reads keep failing. A
+ *    `seriesAdmission.operatorRetirements` entry names the
  *    window and says why; it is applied here, and only to a live window past
  *    its unresolved bound with NO resolution owed (an observed one is
  *    re-published instead, and retires the window `RESOLVED`). The window is
@@ -57,8 +61,9 @@
  *    one that names no window the ledger holds is reported
  *    (`GATEWAY_SERIES_OPERATOR_RETIREMENT_UNMATCHED`). Nothing else retires a
  *    window. The operator's act frees the GATEWAY slot only: a trader that
- *    holds inventory in that window receives no resolution, keeps it HELD,
- *    and recovers with a new run (`apps/trader`, `HELD_UNRESOLVED`).
+ *    holds inventory in that window receives no resolution, keeps it HELD and
+ *    stays at its own cap, and recovers with a new run (`apps/trader`,
+ *    `HELD_UNRESOLVED`).
  * 2. **Discovery** — `GET /events/keyset?series_id=…&closed=false&order=endDate&ascending=true&limit=…&end_date_min=<now>`
  *    and its `after_cursor` pages, up to `maximumPages`
  *    (`docs/venue/verified-2026-10-04.md` F-07, §A2; never `series_slug`,
@@ -1248,7 +1253,7 @@ export class SeriesAdmissionFeedDriver {
         this.#unresolvedScope(window),
         "GATEWAY_SERIES_WINDOW_UNRESOLVED",
         "NOTIFY",
-        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and keeps its cap slot until its resolution is handled — the series admits no window in its place (Decision 1.8). ${this.#latestReadText(record.key)} A resolution missed while the gateway was down or disconnected is not redelivered on the market channel: to recover the slot, name this window in seriesAdmission.operatorRetirements with a reason and restart`,
+        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and keeps its cap slot until its resolution is handled — the series admits no window in its place (Decision 1.8). ${this.#latestReadText(record.key)} Until its row path ends, the window is read every cycle, so a resolution the market channel missed is published by the first read that finds it resolved. Retire it by name (seriesAdmission.operatorRetirements, with a reason, then a restart) only if its row path has ended or its reads keep failing; that frees the gateway's slot only, and a trader holding the window stays at its cap until a new run`,
         [window.internalMarketId],
       );
     }

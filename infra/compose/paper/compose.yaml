@@ -1,0 +1,64 @@
+# The PAPER operations stack: ONE Redis and ONE PostgreSQL for a PAPER run of
+# the data gateway, the trader and the control API (C1-OPS, COMPLEXITY-1).
+#
+# Why a stack of its own, beside the root `docker-compose.yml`:
+#   * The gateway publishes into Redis and the trader consumes from it, so both
+#     must use the SAME Redis. (The two fragments this file replaced each
+#     declared their own Redis on 6379.)
+#   * Its own project name and non-default host ports mean the root stack's
+#     `pnpm test:compose`, which ends in `docker compose down`, cannot stop
+#     the Redis and PostgreSQL a PAPER run is using.
+#   * PostgreSQL is pinned to the image the tests use (16.6, as the root
+#     stack and Testcontainers).
+#
+# Procedure: docs/runbooks/paper-operations.md. Usage, from the repository root:
+#   docker compose -f infra/compose/paper/compose.yaml up -d --wait
+#   REDIS_URL / GATEWAY_REDIS_URL = redis://127.0.0.1:56379
+#   DATABASE_URL = postgres://devlocal:devlocal-only-not-a-secret@127.0.0.1:55432/polymarket_bot_paper
+#
+# SAFETY. Nothing here is required by any test. No credential, signer, wallet
+# or API key appears here: the PostgreSQL password is a dev-local placeholder
+# for a throwaway container on the loopback interface, not a production secret
+# NAME (ADR-010 §3). The four run-mode defaults (MAX_RUN_MODE=PAPER,
+# ALLOW_REAL_ORDERS=false, LIVE_MICRO_MAX_ORDER_NOTIONAL=0,
+# LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0) are not set by this file; the processes
+# run on the host; the trader's and the control API's startup checks enforce them. Every published
+# port binds to 127.0.0.1 (handoff §15).
+name: polymarket-bot-paper
+
+services:
+  redis:
+    image: redis:7.4.2-alpine
+    # Append-only persistence: the transport's retention bound is a safety
+    # parameter (ADR-003), and losing the stream to a container restart turns
+    # an ordinary restart into a hard resync.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${PMB_PAPER_REDIS_PORT:-56379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_USER: devlocal
+      POSTGRES_PASSWORD: devlocal-only-not-a-secret
+      POSTGRES_DB: polymarket_bot_paper
+    ports:
+      - "127.0.0.1:${PMB_PAPER_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devlocal -d polymarket_bot_paper"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis-data:
+  postgres-data:

@@ -1,5 +1,7 @@
 /**
- * `infra/compose/trader/**` — the paper-only local-operation wiring.
+ * `infra/compose/trader/**` and the PAPER operations stack
+ * `infra/compose/paper/compose.yaml` (`C1-OPS`) — the paper-only
+ * local-operation wiring.
  *
  * Two claims, both checkable without Docker (which is absent from this
  * environment; see the suite's disclosure in `README.md`):
@@ -8,7 +10,7 @@
  *    through the trader's own door, which is the only definition of "valid"
  *    this repository has. An example that did not parse would be a document an
  *    operator copies and then debugs;
- * 2. **the compose fragment is paper-only** — no production secret name, no
+ * 2. **the PAPER operations stack is paper-only** — no production secret name, no
  *    live venue endpoint, no signer, and every published port bound to
  *    loopback (§15: "No public network exposure for PostgreSQL, Redis, or
  *    internal metrics endpoints").
@@ -28,7 +30,7 @@ import {
 } from "@polymarket-bot/trader";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const COMPOSE = resolve(REPO_ROOT, "infra/compose/trader/compose.yaml");
+const COMPOSE = resolve(REPO_ROOT, "infra/compose/paper/compose.yaml");
 const EXAMPLE = resolve(REPO_ROOT, "infra/compose/trader/trader.config.example.json");
 
 describe("infra/compose/trader — the example configuration", () => {
@@ -100,7 +102,7 @@ describe("infra/compose/trader — the example configuration", () => {
   });
 });
 
-describe("infra/compose/trader — the compose fragment", () => {
+describe("infra/compose/paper — the PAPER operations stack", () => {
   const compose = readFileSync(COMPOSE, "utf8");
 
   it("publishes every port on LOOPBACK only (§15: no public network exposure)", () => {
@@ -125,6 +127,8 @@ describe("infra/compose/trader — the compose fragment", () => {
       (match) => match[1] ?? "",
     );
     expect(services.sort()).toEqual(["postgres", "redis"]);
+    // `C1-OPS`: the image the tests use, as the root stack pins it.
+    expect(compose).toContain("image: postgres:16.6-alpine");
 
     // No venue endpoint anywhere: the trader has no live execution path and the
     // fragment must not imply one. `image:` and `command:` lines are where an
@@ -138,6 +142,15 @@ describe("infra/compose/trader — the compose fragment", () => {
     expect(directives).not.toContain("clob");
     expect(directives).not.toContain("signer");
     expect(directives).not.toContain("https://");
+  });
+
+  it("is its own compose project on non-default host ports, so the root stack's `docker compose down` cannot stop it (C1-OPS)", () => {
+    const root = readFileSync(resolve(REPO_ROOT, "docker-compose.yml"), "utf8");
+    const nameOf = (text: string): string => /^name:\s*(\S+)\s*$/mu.exec(text)?.[1] ?? "";
+    expect(nameOf(compose)).toBe("polymarket-bot-paper");
+    expect(nameOf(root)).not.toBe(nameOf(compose));
+    const hostPorts = [...compose.matchAll(/^\s*-\s*"127\.0\.0\.1:\$\{[A-Z_]+:-(\d+)\}:\d+"/gmu)].map((match) => match[1]);
+    expect(hostPorts.sort()).toEqual(["55432", "56379"]);
   });
 
   it("carries NO production secret name", () => {

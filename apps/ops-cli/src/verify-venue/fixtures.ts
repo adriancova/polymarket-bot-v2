@@ -277,11 +277,16 @@ export function isSanitizedPlaceholder(value: unknown): boolean {
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function scanForCredentials(
+/**
+ * Recursively reports every credential-shaped key whose value is not a
+ * sanitized placeholder. Exported for the `protocol-v2/` capture gate
+ * (`captures.ts`, V2-9), which scans raw captures with the same rule.
+ */
+export function scanForCredentials(
   value: unknown,
   path: string,
   errors: string[],
@@ -359,7 +364,12 @@ export function isCanonicalPriceString(value: unknown): value is string {
 const DIGIT_STRING_RE = /^\d+$/;
 const HEX_STRING_RE = /^0x[0-9a-fA-F]*$/;
 
-function validateField(
+/**
+ * Validates one value against a field spec, appending errors. Exported for the
+ * `protocol-v2/` capture gate (`captures.ts`, V2-9), which validates sidecars
+ * and pinned capture values with the same field grammar.
+ */
+export function validateField(
   value: unknown,
   spec: FieldSpec,
   path: string,
@@ -615,6 +625,13 @@ export function validatePayload(
 }
 
 /**
+ * The WP-000 envelope's properties, and an example's (V2-9): closed, so an
+ * unknown property fails the gate.
+ */
+export const ENVELOPE_KEYS = ["fixture", "source", "retrieved", "sanitized", "notes", "examples"] as const;
+export const EXAMPLE_KEYS = ["name", "payload"] as const;
+
+/**
  * Validates the common fixture envelope and each example payload against a
  * source-specific spec (recursively: types, enums, optionality, nullability,
  * canonical decimal/price form, map values, unions, strict key sets, and
@@ -628,6 +645,15 @@ export function validateFixtureDocument(
   const errors: string[] = [];
   if (!isRecord(raw)) {
     return { fixture: null, errors: ["document is not a JSON object"] };
+  }
+  // V2-9: the envelope is a closed schema, so a pasted property (`contact`,
+  // `original_cursor`) is refused by name.
+  for (const key of Object.keys(raw)) {
+    if (!(ENVELOPE_KEYS as readonly string[]).includes(key)) {
+      errors.push(
+        `envelope property ${JSON.stringify(key)} is not one of ${ENVELOPE_KEYS.join(", ")} (closed schema)`,
+      );
+    }
   }
   if (raw["fixture"] !== expectedFixtureName) {
     errors.push(
@@ -659,6 +685,13 @@ export function validateFixtureDocument(
       if (!isRecord(example)) {
         errors.push(`examples[${index}] is not an object`);
         return;
+      }
+      for (const key of Object.keys(example)) {
+        if (!(EXAMPLE_KEYS as readonly string[]).includes(key)) {
+          errors.push(
+            `examples[${index}] property ${JSON.stringify(key)} is not one of ${EXAMPLE_KEYS.join(", ")} (closed schema)`,
+          );
+        }
       }
       const name = example["name"];
       if (typeof name !== "string" || name.length === 0) {

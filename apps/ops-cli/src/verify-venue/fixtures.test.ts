@@ -13,6 +13,7 @@ import {
   SDK_PERMALINK_PREFIX,
   SDK_REFERENCE_COMMIT,
   VENUE_CHECKS,
+  snapshotDateOf,
 } from "./checks.js";
 import type { VenueCheck } from "./checks.js";
 import {
@@ -32,7 +33,9 @@ import type {
 import {
   CITATION_EXEMPT_SECTIONS,
   REQUIRED_REPORT_SECTIONS,
+  claimedFixturePaths,
   formatVenueVerificationReport,
+  listFixtureFiles,
   loadAndValidateReport,
   reportHeadings,
   reportSectionHasOfficialCitation,
@@ -257,18 +260,27 @@ describe("venue fixture catalog", () => {
       "geoblock",
       "position-operations",
       "chainlink-twap-rtds",
+      // V2-9: the Protocol V2 checks.
+      "market-ws-book-v2",
+      "position-operations-v2",
+      "protocol-v2-captures",
     ]) {
       expect(ids).toContain(required);
     }
   });
 
   it("every fixture file on disk is claimed by exactly one check", () => {
-    const onDisk = listJsonFiles(VENUE_FIXTURE_ROOT);
-    const claimed = fixtureChecks
-      .flatMap((check) => [...check.fixtures])
-      .sort();
+    // V2-9: EVERY file except a README.md, whatever its suffix. The earlier
+    // `.json`-only listing is how the `protocol-v2/` `.jsonc` and `.jsonl`
+    // captures sat outside this gate (plan row D9).
+    const onDisk = listFixtureFiles(VENUE_FIXTURE_ROOT);
+    const claimed = claimedFixturePaths(VENUE_CHECKS).sort();
     expect(claimed).toEqual([...new Set(claimed)]);
     expect(onDisk).toEqual(claimed);
+    // The envelope fixtures are still exactly the fixture checks' files.
+    expect(listJsonFiles(VENUE_FIXTURE_ROOT)).toEqual(
+      fixtureChecks.flatMap((check) => [...check.fixtures]).sort(),
+    );
   });
 
   it("no reachable object schema is permissive (non-strict, non-mapped) at ANY nesting level", () => {
@@ -379,7 +391,9 @@ describe("venue fixture structural validation", () => {
         expect(result.errors).toEqual([]);
         expect(result.ok).toBe(true);
         expect(result.fixture?.sanitized).toBe(true);
-        expect(result.fixture?.retrieved).toBe("2026-08-24");
+        // 2026-08-24 for the frozen baseline; 2026-10-05 for the V2 checks
+        // (V2-9), each pinned to its report's snapshot date.
+        expect(result.fixture?.retrieved).toBe(snapshotDateOf(check));
         expect(result.fixture?.examples.length).toBeGreaterThan(0);
       });
     }
