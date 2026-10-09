@@ -227,7 +227,8 @@ reads the planned order; there is no side table. An intent whose value cannot
 be resolved is refused rather than planned.
 
 Static Bracket refuses a `FAK` or `FOK` `immediate_order_type` until ADR-034
-D4 is built after the execution probe (COMPLEXITY-1, 2026-10-08); the example
+D4 is built after the execution probe (COMPLEXITY-1, 2026-10-08), and a `GTC`
+one until D3.4's deadline cancel is built; the example
 configuration's entry is `GTD`, which the simulated venue expires at the plan's
 deadline.
 

@@ -373,6 +373,30 @@ function entryExecutionUnfolded(state: StaticBracketState): boolean {
 }
 
 /**
+ * True while the ENTRY can still add to the allocation: an execution the venue
+ * reported is unfolded ({@link entryExecutionUnfolded}), OR the entry order is
+ * still LIVE at the venue (`C1-TIF` r1, finding C1-TIF-01).
+ *
+ * A live entry is the GTD case. Since `C1-TIF` an immediate entry is GTD, and
+ * one that fills in part RESTS its remainder until its deadline, where a FAK
+ * cancelled it at once. The exit is sized from the fold, so the take-profit
+ * can sell everything folded while the remainder still rests. Certifying
+ * CLOSED then left §13.3 no edge for the remainder's fill: it was refused as an
+ * illegal transition, the fill was never folded, and the bracket resumed into
+ * CLOSED holding shares with no exit. The same fill out of `OPEN` is refused
+ * the same way. So rules 2 and 3 of {@link entryExecutionUnfolded} hold while
+ * this does: the bracket stays in its exit state, whose ENTRY_PARTIAL_FILL /
+ * ENTRY_FILL_COMPLETE edges fold the fill, and the ladder exits what it
+ * added. The wait is bounded by the entry's own deadline: the venue expires a
+ * GTD entry there, its terminal view clears the track
+ * ({@link settleTerminalOrder}), and the next evaluation closes.
+ */
+function entryMayStillFill(state: StaticBracketState): boolean {
+  const entry = state.entryOrder;
+  return entryExecutionUnfolded(state) || (entry !== null && isLive(entry.state));
+}
+
+/**
  * The venue order type EVERY exit this strategy emits states for itself
  * (`RISK-2`, found only once GOV-2B blocker B2 stopped refusing these intents).
  *
@@ -1674,7 +1698,7 @@ function settleTerminalOrder(
       : state.instanceState === "EXIT_WORKING"
         ? "EXIT_ORDER_TERMINAL_UNFILLED"
         : null;
-  if (trigger !== null && !isZero(openShares(state)) && !entryExecutionUnfolded(state)) {
+  if (trigger !== null && !isZero(openShares(state)) && !entryMayStillFill(state)) {
     // The exit order is gone and the allocation is not: the position is open
     // again and re-plannable. The trigger differs by state because the §13.3
     // table names a different edge out of each.
@@ -1903,6 +1927,11 @@ function planExit(
       // closing it here would certify a flat book over shares still held (the
       // paused-fold-then-resume route reached exactly that). Wait for the fill.
       return plan(state, "hold", [...reasons, REASONS.awaitingFillAllocation]);
+    }
+    if (entryMayStillFill(state)) {
+      // C1-TIF-01: everything folded has exited, but the entry's remainder is
+      // still live and can fill. Wait for it to fill or to end.
+      return plan(state, "hold", [...reasons, REASONS.entryOrderWorking]);
     }
     // Nothing is held: the bracket is finished. The trigger differs by state so
     // that every edge taken is one the §13.3 table actually contains.
@@ -2540,8 +2569,9 @@ function retireExpiredReduce(
   if (observation.nowMs <= intentValidUntilMs(params, track)) return null;
   const cleared = withState(state, { exitOrder: null });
   // As in {@link settleTerminalOrder}: not into `OPEN` while an entry execution
-  // is unfolded (BR1-H1) — the late entry fill folds only from the exit states.
-  if (state.instanceState === "EXIT_PLANNED" && !entryExecutionUnfolded(state)) {
+  // is unfolded (BR1-H1) or the entry is still live (C1-TIF-01) — the late
+  // entry fill folds only from the exit states.
+  if (state.instanceState === "EXIT_PLANNED" && !entryMayStillFill(state)) {
     // MOVE-SITE: exitIntentExpired TRIGGERS: EXIT_ABANDONED
     const moved = move(cleared, "EXIT_ABANDONED");
     if (moved.ok) {
@@ -3041,8 +3071,9 @@ function applyExitFill(
   // bracket's partial-fill edge, keeps the exit track (so its own terminal view
   // still settles it by id), records no cool-down anchor, and says what it is
   // waiting for. The late entry fill then folds from the exit states, and the
-  // ordinary ladder exits what it added.
-  const closes = flat && !entryExecutionUnfolded(state);
+  // ordinary ladder exits what it added. `C1-TIF` r1 (C1-TIF-01): nor while the
+  // entry order is still live — a GTD entry's resting remainder can fill.
+  const closes = flat && !entryMayStillFill(state);
   const changes: Partial<StaticBracketState> = {
     exitOrder: closes ? null : orderMoved.value,
     exitedShares: exited.value,
@@ -3068,9 +3099,11 @@ function applyExitFill(
     "hold",
     closes
       ? [REASONS.exitFilled, REASONS.closed]
-      : flat
-        ? [REASONS.exitFilled, REASONS.awaitingFillAllocation]
-        : [REASONS.exitFilled],
+      : !flat
+        ? [REASONS.exitFilled]
+        : entryExecutionUnfolded(state)
+          ? [REASONS.exitFilled, REASONS.awaitingFillAllocation]
+          : [REASONS.exitFilled, REASONS.entryOrderWorking],
   );
 }
 

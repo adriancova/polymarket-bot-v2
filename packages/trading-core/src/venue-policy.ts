@@ -9,6 +9,7 @@
  * the holder: only the venue's book provider does (`venue-builder.ts`).
  */
 
+import { TIME_IN_FORCE_VALUES } from "@polymarket-bot/execution-planner";
 import type { Clock, PlannedOrderView, TimeInForce } from "@polymarket-bot/simulation";
 
 import type { PaperTrader } from "./trader.js";
@@ -17,8 +18,6 @@ import type { PaperTrader } from "./trader.js";
 export interface VenueWiring {
   trader: PaperTrader | undefined;
 }
-
-const TIME_IN_FORCE_VALUES: readonly unknown[] = Object.freeze(["GTC", "GTD", "FAK", "FOK"]);
 
 /**
  * What the policy reads of a planned order beyond {@link PlannedOrderView}: the
@@ -72,7 +71,7 @@ export function createExecutionPolicy(
   };
   return {
     timeInForceFor(order: PlannedOrderWithTimeInForce): TimeInForce {
-      if (!TIME_IN_FORCE_VALUES.includes(order.timeInForce)) {
+      if (!(TIME_IN_FORCE_VALUES as readonly unknown[]).includes(order.timeInForce)) {
         return refuse(order, "carries no time-in-force the venue knows");
       }
       return order.timeInForce as TimeInForce;

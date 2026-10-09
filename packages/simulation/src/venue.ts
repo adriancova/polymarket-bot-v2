@@ -167,10 +167,10 @@ export interface ExecutionPolicy {
   /**
    * The time-in-force to simulate for a planned order.
    *
-   * WP-190's `PlannedOrder` carries `executionStyle` and `postOnly` but no
-   * time-in-force — the planner does not choose one. So the venue asks the
-   * composition root rather than assuming a default: a silently assumed `FAK`
-   * would change every unfilled remainder's fate.
+   * Since `C1-TIF` (ADR-034 D3.1 item 2) the planner's `PlannedOrder` carries
+   * its `timeInForce`, and the composition root's policy reads it from there.
+   * The venue still asks the policy rather than assuming a default: a silently
+   * assumed `FAK` would change every unfilled remainder's fate.
    */
   timeInForceFor(order: PlannedOrderView): TimeInForce;
   /** The stated GTD expiry, in recorded monotonic nanoseconds, when GTD. */

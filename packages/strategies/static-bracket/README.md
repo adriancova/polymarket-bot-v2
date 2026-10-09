@@ -36,7 +36,7 @@ information §13.2 does not carry (feature keys, a fee estimate, a
 submission-silence bound, an order validity horizon, a staleness bound and its
 policy). Each is listed with its basis in the `src/params.ts` header.
 
-### `immediate_order_type`: GTD or GTC; FAK and FOK are refused (`C1-TIF`, 2026-10-08)
+### `immediate_order_type`: GTD only; FAK, FOK and GTC are refused (`C1-TIF`, 2026-10-08)
 
 The venue's FAK and FOK BUY is collateral-targeted (ADR-034 D4), so a fill can
 buy more shares than were planned and the share caps are not hard. The user
@@ -49,6 +49,18 @@ venue expires it at the plan's deadline (`order_validity_ms`, bounded by the
 trader's `maxPlanLifetimeMs`). **The trade-off:** a marketable GTD entry that
 fills in part RESTS its remainder until that deadline, where a FAK would have
 cancelled it at once. Exits are GTC, whatever this key says.
+
+`GTC` is refused too, named `SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL`
+(`C1-TIF` r1). The ruling admits a GTC entry only with ADR-034 D3.4's deadline
+cancel, and that cancel is not built.
+
+**While the entry rests, the bracket is not finished** (`C1-TIF` r1, finding
+C1-TIF-01). The exits are sized from the folded fills, so the take-profit can
+sell everything folded while the remainder still rests. The bracket then waits
+in its exit state (`SB.ENTRY_ORDER_WORKING`) instead of certifying `CLOSED` or
+falling back to `OPEN`. A later fill of the remainder folds from there and is
+exited like any other. The remainder's expiry clears the entry, and the next
+evaluation closes the bracket.
 
 ### Grammar versions 1 and 2 (`THROUGHPUT-1c`, ADR-023)
 

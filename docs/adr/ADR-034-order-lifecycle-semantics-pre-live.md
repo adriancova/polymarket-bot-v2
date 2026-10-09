@@ -2513,6 +2513,14 @@ deadline,** so the share caps stay hard.
   deadline.
 - **The trade-off.** A GTD entry that fills in part RESTS its remainder until
   its deadline, where a FAK cancelled it at once.
+- Static Bracket also refuses a GTC `immediate_order_type`, named
+  `SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL`, until D3.4's deadline
+  cancel is built (C1-TIF review round 1).
+- While a GTD entry's remainder rests, the bracket is not finished. Its exits
+  are sized from the folded fills, so a take-profit can sell everything folded
+  first. The bracket then waits in its exit state instead of certifying
+  `CLOSED`, so a later fill of the remainder is folded and exited (C1-TIF
+  review round 1, finding C1-TIF-01).
 - Exits are unchanged: Static Bracket's exits are GTC; none is FAK or FOK.
 - **Before any GTD entry runs above PAPER:** a 30 s GTD states an expiration
   about 90 s ahead, below the venue's floor of 180 s plus a margin (D3.3; A

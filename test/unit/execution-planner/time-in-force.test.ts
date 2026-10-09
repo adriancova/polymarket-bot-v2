@@ -79,6 +79,21 @@ describe("C1-TIF — a GTD order states its plan's deadline plus the venue's 60 
     for (const order of orders(plan)) expect(order.expirationUnixSeconds).toBe(expected);
   });
 
+  it("an intent's validUntil EARLIER than the policy's lifetime is the deadline the expiration states (C1-TIF r1)", () => {
+    // Planned 12:00:00 with a 600 000 ms lifetime (12:10:00); the intent dies
+    // at 12:05:00.400, so the deadline is that, and the expiration is stated
+    // from it — never from the later policy deadline.
+    const result = buildExecutionPlan(
+      approvedPosition({ validUntil: "2026-09-02T12:05:00.400Z" }),
+      planningInputs({ timeInForce: "GTD" }),
+    );
+    if (!result.ok) throw new Error(JSON.stringify(result.refusals, null, 2));
+    const plan = result.value as PlacementPlan;
+    expect(plan.deadline).toBe("2026-09-02T12:05:00.400Z");
+    const expected = Date.parse("2026-09-02T12:05:01.000Z") / 1000 + 60;
+    for (const order of orders(plan)) expect(order.expirationUnixSeconds).toBe(expected);
+  });
+
   it("states no expiration for GTC, FAK or FOK", () => {
     for (const timeInForce of ["GTC", "FAK", "FOK"]) {
       for (const order of orders(placement(planningInputs({ timeInForce })))) {

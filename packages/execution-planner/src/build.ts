@@ -109,17 +109,11 @@ function assemble(
   legs: readonly PricedLeg[],
   view: ApprovedIntentView,
   inputs: PlanningInputs,
-  deadline: string,
+  deadlineMs: number,
 ): PlannerResult<AssembledGroups> {
   // ADR-034 D3.1 item 2: the plan's ONE time-in-force, on every order. A GTD
   // order states `deadline + 60 s` (D3.3), so the venue's one-minute early
   // expiry ends it at the plan's deadline.
-  const deadlineMs = instantMilliseconds(deadline);
-  if (deadlineMs === undefined) {
-    return plannerFailure(
-      plannerRefusal("PLAN_INPUT_INVALID", "the plan deadline could not be read while stating a GTD expiration", { deadline }),
-    );
-  }
   const timeInForce =
     inputs.timeInForce === "GTD"
       ? {
@@ -230,13 +224,24 @@ function assemble(
   };
 }
 
-/** `min(validUntil, plannedAt + maxPlanLifetimeMs)`, or refusals. */
+/** A plan deadline: the instant text the plan states, and its epoch milliseconds. */
+interface PlacementDeadline {
+  readonly text: string;
+  readonly ms: number;
+}
+
+/**
+ * `min(validUntil, plannedAt + maxPlanLifetimeMs)`, or refusals. It returns the
+ * parsed instant with the text, so a GTD expiration is stated from the same
+ * value and never re-parsed (`C1-TIF` r1, finding L4).
+ */
 function placementDeadline(
   validUntil: string | undefined,
   inputs: PlanningInputs,
-): PlannerResult<string> {
+): PlannerResult<PlacementDeadline> {
   const policyDeadline = instantPlusMilliseconds(inputs.plannedAt, inputs.policy.maxPlanLifetimeMs);
-  if (policyDeadline === undefined) {
+  const policyMs = policyDeadline === undefined ? undefined : instantMilliseconds(policyDeadline);
+  if (policyDeadline === undefined || policyMs === undefined) {
     return plannerFailure(
       plannerRefusal("PLAN_INPUT_INVALID", "the plan deadline could not be computed from plannedAt and maxPlanLifetimeMs", {
         plannedAt: inputs.plannedAt,
@@ -244,11 +249,10 @@ function placementDeadline(
       }),
     );
   }
-  if (validUntil === undefined) return { ok: true, value: policyDeadline };
+  if (validUntil === undefined) return { ok: true, value: { text: policyDeadline, ms: policyMs } };
   const intentMs = instantMilliseconds(validUntil);
   const plannedMs = instantMilliseconds(inputs.plannedAt);
-  const policyMs = instantMilliseconds(policyDeadline);
-  if (intentMs === undefined || plannedMs === undefined || policyMs === undefined) {
+  if (intentMs === undefined || plannedMs === undefined) {
     return plannerFailure(
       plannerRefusal("PLAN_INPUT_INVALID", "an instant could not be compared while computing the deadline", {
         validUntil,
@@ -265,7 +269,10 @@ function placementDeadline(
       ),
     );
   }
-  return { ok: true, value: intentMs <= policyMs ? validUntil : policyDeadline };
+  return {
+    ok: true,
+    value: intentMs <= policyMs ? { text: validUntil, ms: intentMs } : { text: policyDeadline, ms: policyMs },
+  };
 }
 
 function planBase(view: ApprovedIntentView, executionPlanId: string, plannedAt: string, deadline: string) {
@@ -380,12 +387,12 @@ function buildPositionPlan(
     ],
     view,
     inputs,
-    deadline.value,
+    deadline.value.ms,
   );
   if (!assembled.ok) return assembled;
 
   const draft: PlacementPlan = {
-    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value),
+    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value.text),
     planKind: "POSITION",
     priority: "PLACEMENT",
     priceProtection: { mode: "CAPPED_LIMIT_ORDERS_ONLY" },
@@ -474,11 +481,11 @@ function buildReductionPlan(
     );
   }
 
-  const assembled = assemble(legs, view, inputs, deadline.value);
+  const assembled = assemble(legs, view, inputs, deadline.value.ms);
   if (!assembled.ok) return assembled;
 
   const draft: PlacementPlan = {
-    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value),
+    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value.text),
     planKind: "REDUCE_POSITION",
     priority: "PLACEMENT",
     priceProtection: { mode: "CAPPED_LIMIT_ORDERS_ONLY" },
@@ -623,11 +630,11 @@ function buildBasketPlan(
     );
   }
 
-  const assembled = assemble(legs, view, inputs, deadline.value);
+  const assembled = assemble(legs, view, inputs, deadline.value.ms);
   if (!assembled.ok) return assembled;
 
   const draft: BasketPlan = {
-    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value),
+    ...planBase(view, inputs.executionPlanId, inputs.plannedAt, deadline.value.text),
     planKind: "BASKET",
     priority: "PLACEMENT",
     // COORDINATED is the only value the contract admits; §7.7: "Basket

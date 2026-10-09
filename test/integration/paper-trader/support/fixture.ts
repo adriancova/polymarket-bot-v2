@@ -389,7 +389,13 @@ export function recordedEvents(
 
 /**
  * The fixture with a RESTING entry: a post-only BUY at `0.30`, below the best
- * ask, held under `GTC`.
+ * ask, held under `GTD` with a one-hour deadline.
+ *
+ * `C1-TIF` r1: it was `GTC`, which Static Bracket now refuses
+ * (`SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL`). The deadline
+ * (`order_validity_ms` and the trader's `maxPlanLifetimeMs`) is an hour so the
+ * entry outlives `pauseInstanceByWatchdog`'s clock jump (about 1,000 s of
+ * monotonic time); a 30 s GTD expires inside it.
  *
  * WHY IT EXISTS. The shipped fixture's entry is a `FAK` taker that fills and
  * goes terminal in the same instant, so three properties have no observable
@@ -410,6 +416,7 @@ export function restingEntryConfig(
   const entry = params["entry"] as Record<string, unknown>;
   return {
     ...base,
+    planning: { ...(base["planning"] as Record<string, unknown>), maxPlanLifetimeMs: 3_600_000 },
     instances: [
       {
         ...instance,
@@ -421,7 +428,8 @@ export function restingEntryConfig(
               ...(entry["execution"] as Record<string, unknown>),
               liquidity_preference: "MAKER_ONLY",
               passive_price: "0.3",
-              immediate_order_type: "GTC",
+              immediate_order_type: "GTD",
+              order_validity_ms: 3_600_000,
             },
           },
         },

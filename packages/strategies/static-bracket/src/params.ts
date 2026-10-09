@@ -145,12 +145,25 @@ export type ImmediateOrderType = (typeof IMMEDIATE_ORDER_TYPES)[number];
  *
  * The venue's FAK and FOK BUY is collateral-targeted (ADR-034 D4), so its share
  * caps are not hard for the fill. D4 is parked until the execution probe, so
- * an entry is a share-sized GTD order (it expires at `order_validity_ms`) or a
- * GTC one. Every entry can be a BUY (its direct leg always is), so the value is
- * refused outright, never only for some legs. Exits are GTC whatever this says.
+ * an entry is a share-sized GTD order (it expires at `order_validity_ms`).
+ * Every entry can be a BUY (its direct leg always is), so the value is refused
+ * outright, never only for some legs. Exits are GTC whatever this says.
  */
 export const IMMEDIATE_ORDER_TYPE_PARKED = "SB_IMMEDIATE_ORDER_TYPE_PARKED_UNTIL_EXECUTION_PROBE";
 const PARKED_IMMEDIATE_ORDER_TYPES: readonly ImmediateOrderType[] = Object.freeze(["FAK", "FOK"]);
+
+/**
+ * The name of the refusal of a GTC `immediate_order_type` (`C1-TIF` r1,
+ * finding L2).
+ *
+ * The ruling admits a GTC entry only WITH a deadline cancel (ADR-034 D3.4), and
+ * that cancel is not built: nothing would end a GTC entry's remainder at its
+ * plan's deadline. A GTD entry needs no cancel, because the venue expires it
+ * there. And since `C1-TIF` r1 a bracket waits in its exit states while its
+ * entry is live (C1-TIF-01), so an entry with no deadline could hold the
+ * bracket there until the market closes. Lift this when D3.4 is built.
+ */
+export const IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL = "SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL";
 
 export const REDUCTION_URGENCIES = Object.freeze(["NORMAL", "AGGRESSIVE", "IMMEDIATE"] as const);
 export type ReductionUrgency = (typeof REDUCTION_URGENCIES)[number];
@@ -651,7 +664,14 @@ function parseExecution(entry: PlainRecord): Outcome<EntryExecutionParams> {
     return bad(
       `${IMMEDIATE_ORDER_TYPE_PARKED}: ${path}.immediate_order_type ${immediateOrderType.value} is refused. ` +
         "A FAK or FOK BUY entry is collateral-targeted at the venue (ADR-034 D4), and D4 is parked until " +
-        "the execution probe (COMPLEXITY-1, 2026-10-08). Use GTD, which expires at order_validity_ms, or GTC.",
+        "the execution probe (COMPLEXITY-1, 2026-10-08). Use GTD, which expires at order_validity_ms.",
+    );
+  }
+  if (immediateOrderType.value === "GTC") {
+    return bad(
+      `${IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL}: ${path}.immediate_order_type GTC is refused. ` +
+        "A GTC entry needs ADR-034 D3.4's deadline cancel, which is not built (COMPLEXITY-1, 2026-10-08). " +
+        "Use GTD, which expires at order_validity_ms.",
     );
   }
   const partialFillPolicy = readEnum(record.value, "partial_fill_policy", path, PARTIAL_FILL_POLICIES);

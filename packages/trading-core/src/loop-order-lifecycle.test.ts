@@ -584,9 +584,10 @@ function assemble(
      * `C1-TIF`: the order type the VENUE simulates the entry as. The entry is
      * configured GTD (FAK and FOK are refused at Static Bracket's validation
      * since `C1-TIF`) and its plan carries GTD; to keep pinning the loop's
-     * handling of FAK and FOK venue OUTCOMES, the venue simulates it as this
-     * (FAK by default; "GTD" simulates the plan's own type). Exits are GTC on
-     * the plan and at the venue.
+     * handling of FAK and FOK venue OUTCOMES, the venue simulates it as this.
+     * The default is "GTD", the plan's own type and the shipped path
+     * (`C1-TIF` r1, finding L6); O1, O2 and SIM1-R1-1 name FAK or FOK. Exits
+     * are GTC on the plan and at the venue.
      */
     readonly entryAtVenue?: "FAK" | "FOK" | "GTD";
     /** A stated GTD expiry the venue's policy answers instead of the plan's. */
@@ -617,7 +618,7 @@ function assemble(
   type PolicyOrder = Parameters<typeof production.timeInForceFor>[0];
   const planTimeInForce = new Map<string, unknown>();
   const planExpiration = new Map<string, unknown>();
-  const entryAtVenue = input.entryAtVenue ?? "FAK";
+  const entryAtVenue = input.entryAtVenue ?? "GTD";
   const books = (input.books ?? ((base: MarketBookProvider) => base))({
     book(request): BookView | undefined {
       const market = wiring.trader?.markets.get(request.marketId);
@@ -1335,7 +1336,7 @@ describe("SIM-1 (O1-O4) — a remainder the venue can no longer work is terminal
     // The venue sees only the best YES ask level (30 @ 0.34) when the entry
     // arrives; the loop's own book is untouched.
     const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
-    const parts = assemble({ books: clipped(clip) });
+    const parts = assemble({ books: clipped(clip), entryAtVenue: "FAK" });
     await drive(parts, 1, 5);
     clip.apply = undefined;
     const { entry } = ordersByRole(parts);
@@ -1475,6 +1476,50 @@ describe("C1-TIF (ADR-034 D3.1 item 2, D3.3) — the shipped GTD entry: its expi
     expect(`${String(expired?.state)} ${String(expired?.filledShares)}/50`).toBe("EXPIRED 30/50");
     expect(parts.trader.loop.health().seams.reservations).toMatchObject({ released: 1, reservedCollateral: "0" });
   });
+
+  it("C1-TIF-01: the remainder fills AFTER the take-profit sold the folded 30 — it is folded and exited, never stranded", async () => {
+    // r0's verifiers reproduced this through this harness: the take-profit for
+    // the folded 30 filled, the bracket certified CLOSED with the remainder
+    // still resting, and the remainder's fill was refused as an illegal
+    // transition, leaving 20 shares in the ledger with no exit.
+    const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
+    const parts = assemble({ books: clipped(clip), entryAtVenue: "GTD" });
+    await drive(parts, 1, 5);
+    clip.apply = undefined;
+    const { entry, takeProfit } = ordersByRole(parts);
+    expect(`${entry.state} ${entry.filledShares}/${entry.requestedShares}`).toBe("PARTIALLY_FILLED 30/50");
+    expect(`${String(takeProfit?.state)} ${String(takeProfit?.requestedShares)}`).toBe("RESTING 30");
+    const trade = (ordinal: number, price: string, takerSide: "BID" | "ASK", receivedAt: string): IngestedEvent =>
+      ingested(
+        {
+          eventType: "PublicTradeObserved",
+          payload: { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, price, size: "500", takerSide },
+          receivedAt,
+        },
+        ordinal,
+      );
+    // A buyer lifts 0.55: the take-profit sells the folded 30.
+    await driveOne(parts, trade(6, "0.55", "BID", "2026-05-01T09:00:03.000Z"), 6);
+    expect(virtualYes(parts.trader.loop)).toBe("0");
+    // A seller hits 0.3, inside the deadline: the resting remainder buys 20.
+    await driveOne(parts, trade(7, "0.3", "ASK", "2026-05-01T09:00:04.000Z"), 7);
+    const filled = parts.venue.inner.ordersSnapshot().find((order) => order.simulatedOrderId === entry.simulatedOrderId);
+    expect(`${String(filled?.state)} ${String(filled?.filledShares)}/50`).toBe("FILLED 50/50");
+    expect(virtualYes(parts.trader.loop)).toBe("20");
+    await driveOne(parts, quietEvent(8, "2026-05-01T09:00:05.000Z"), 8);
+    const codes = parts.evaluations.flatMap((evaluation) => evaluation.reasonCodes);
+    expect(codes).not.toContain("SB.ILLEGAL_TRANSITION");
+    expect(codes).not.toContain("SB.PAUSED");
+    expect(parts.trader.registry.get(INSTANCE_ID)?.runtime.instanceStatus()).not.toBe("PAUSED");
+    // The 20 are exited: a take-profit for exactly them is resting.
+    const second = parts.venue.inner
+      .ordersSnapshot()
+      .filter((order) => order.action === "SELL" && order.simulatedOrderId !== takeProfit?.simulatedOrderId);
+    expect(second.map((order) => `${order.state} ${order.requestedShares}@${order.limitPrice}`)).toEqual(["RESTING 20@0.5"]);
+    // …and once it sells them, the instance is flat.
+    await driveOne(parts, trade(9, "0.55", "BID", "2026-05-01T09:00:06.000Z"), 9);
+    expect(virtualYes(parts.trader.loop)).toBe("0");
+  });
 });
 
 describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY is REJECTED, released, and HALTS; it never stays open", () => {
@@ -1490,7 +1535,7 @@ describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY
     // A canonical 1,024-character balance: 30 × 0.34 = 10.2 plus a fractional
     // fee makes the post-fill balance longer than the decimal package's
     // 1,024-character limit, so the venue's fill accounting refuses.
-    const parts = assemble({ books: clipped(clip), tier1: { secondsDelay: DELAY_S, startingCash: "9".repeat(1024) } });
+    const parts = assemble({ books: clipped(clip), entryAtVenue: "FAK", tier1: { secondsDelay: DELAY_S, startingCash: "9".repeat(1024) } });
     await drive(parts, 1, 5);
     const { entry } = ordersByRole(parts);
     expect(`${entry.state} ${entry.filledShares}/${entry.requestedShares}`).toBe("DELAYED 0/50");
@@ -1545,6 +1590,7 @@ describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY
     const venueClock = new ManualClock(T_OPEN);
     const parts = assemble({
       books: clipped(clip),
+      entryAtVenue: "FAK",
       tier1: { secondsDelay: DELAY_S, startingCash: "9".repeat(1024), venueClock },
     });
     await drive(parts, 1, 5);
@@ -1578,7 +1624,7 @@ describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY
 
   it("the control: the same DELAYED entry with an ordinary balance resolves CANCELLED 30/50 at matchableAtNs — released, retired, settled, and nothing halts", async () => {
     const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
-    const parts = assemble({ books: clipped(clip), tier1: { secondsDelay: DELAY_S, startingCash: "1000" } });
+    const parts = assemble({ books: clipped(clip), entryAtVenue: "FAK", tier1: { secondsDelay: DELAY_S, startingCash: "1000" } });
     await drive(parts, 1, 5);
     const { entry } = ordersByRole(parts);
     expect(`${entry.state} ${entry.filledShares}/${entry.requestedShares}`).toBe("DELAYED 0/50");

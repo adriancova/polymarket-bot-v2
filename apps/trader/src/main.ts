@@ -205,15 +205,15 @@
  *
  * ## The two-phase venue wiring, and why it is not a smell
  *
- * The simulated venue asks the composition root two questions it cannot answer
- * itself: what BOOK a market has (§12.2's Tier-0 depth) and what TIME-IN-FORCE a
- * planned order carries (`ExecutionPolicy.timeInForceFor` — "a silently assumed
- * `FAK` would change every unfilled remainder's fate"). Both answers live inside
- * the trader the venue is a constructor argument to.
+ * The simulated venue asks the composition root what BOOK a market has
+ * (§12.2's Tier-0 depth), and that answer lives inside the trader the venue is
+ * a constructor argument to. (It also asks what TIME-IN-FORCE a planned order
+ * carries, `ExecutionPolicy.timeInForceFor`; since `C1-TIF` the policy reads
+ * that from the planned order itself, ADR-034 D3.1 item 2.)
  *
  * So the venue is built against a HOLDER that the trader fills immediately
- * after construction. The alternative — letting the venue default either answer
- * — is the one thing `packages/simulation` explicitly refuses to do, and the
+ * after construction. The alternative — letting the venue default the answer —
+ * is the one thing `packages/simulation` explicitly refuses to do, and the
  * holder is unset for exactly the window in which no event has been processed
  * and therefore no plan can exist.
  *
@@ -374,8 +374,9 @@ export interface StartupPorts {
  *
  * "NEVER THROWS", PRECISELY (review round 1, MEDIUM-3). Every refusal below is
  * a logged line and an {@link EXIT_CODES} value. There is exactly ONE `throw`
- * reachable from this file — {@link createExecutionPolicy}'s unresolvable
- * time-in-force — and it is not thrown on this call stack: the venue invokes
+ * reachable from this file — {@link createExecutionPolicy}'s refusal of a
+ * planned order with no readable time-in-force (or a GTD order with no readable
+ * expiration) — and it is not thrown on this call stack: the venue invokes
  * the policy inside its own `totallyResult` boundary and answers a refused
  * `ExecutionResult`. `main.test.ts` drives that through a real `SimulatedVenue`
  * and asserts the refusal rather than the exception.
